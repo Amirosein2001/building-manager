@@ -536,6 +536,17 @@ CHART_TYPES = [
 ]
 
 
+def _get_output_dir():
+    """پوشه‌ی temp_charts — سازگار با exe و حالت توسعه"""
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(base, "temp_charts")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
 def generate_chart(chart_type, data, bill_type, unit_label="",
                    is_dark=False, mode="consumption"):
     if not data:
@@ -543,16 +554,17 @@ def generate_chart(chart_type, data, bill_type, unit_label="",
     handler = None
     for ct, _, fn in CHART_TYPES:
         if ct == chart_type:
-            handler = fn; break
+            handler = fn
+            break
     if handler is None:
         return {"success": False, "path": None,
                 "message": f"نوع نامعتبر: {chart_type}"}
     try:
         img = handler(data, bill_type, unit_label, is_dark, mode=mode)
         if img is None:
-            return {"success": False, "path": None, "message": "نمودار قابل رسم نیست"}
-        d = os.path.join(os.getcwd(), "temp_charts")
-        os.makedirs(d, exist_ok=True)
+            return {"success": False, "path": None,
+                    "message": "نمودار قابل رسم نیست"}
+        d = _get_output_dir()
         safe = "".join(c for c in f"{chart_type}_{mode}_{bill_type}"
                        if c.isalnum() or c in "._-")
         p = os.path.join(d, f"{safe}.png")

@@ -91,44 +91,44 @@ def fmt_money(amount, show_unit=True, unit="ریال"):
         return "۰"
 
 
+def _get_fonts_dir():
+    """پیدا کردن مسیر فونت‌ها — سازگار با PyInstaller exe و حالت توسعه"""
+    if getattr(sys, 'frozen', False):
+        # حالت exe: دنبال fonts توی مسیرهای مختلف بگرد
+        candidates = []
+        if hasattr(sys, '_MEIPASS'):
+            candidates.append(os.path.join(sys._MEIPASS, "fonts"))
+        exe_dir = os.path.dirname(sys.executable)
+        candidates.append(os.path.join(exe_dir, "fonts"))
+        candidates.append(os.path.join(exe_dir, "_internal", "fonts"))
+        for c in candidates:
+            if os.path.isdir(c):
+                return c
+    # حالت توسعه (python app.py)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+
+
 def register_fonts():
     if not HAS_REPORTLAB:
         return False
     try:
-        fonts_dir = os.path.join(
-            os.getcwd(), "fonts"
-        )
-        regular_path = os.path.join(
-            fonts_dir, "Vazirmatn-Regular.ttf"
-        )
-        bold_path = os.path.join(
-            fonts_dir, "Vazirmatn-Bold.ttf"
-        )
-        medium_path = os.path.join(
-            fonts_dir, "Vazirmatn-Medium.ttf"
-        )
+        fonts_dir = _get_fonts_dir()
+        print(f"مسیر فونت‌ها: {fonts_dir}")
+
+        regular_path = os.path.join(fonts_dir, "Vazirmatn-Regular.ttf")
+        bold_path = os.path.join(fonts_dir, "Vazirmatn-Bold.ttf")
+        medium_path = os.path.join(fonts_dir, "Vazirmatn-Medium.ttf")
 
         if os.path.exists(regular_path):
-            pdfmetrics.registerFont(
-                TTFont('Vazirmatn', regular_path)
-            )
+            pdfmetrics.registerFont(TTFont('Vazirmatn', regular_path))
         if os.path.exists(bold_path):
-            pdfmetrics.registerFont(
-                TTFont(
-                    'Vazirmatn-Bold', bold_path
-                )
-            )
+            pdfmetrics.registerFont(TTFont('Vazirmatn-Bold', bold_path))
         if os.path.exists(medium_path):
-            pdfmetrics.registerFont(
-                TTFont(
-                    'Vazirmatn-Medium', medium_path
-                )
-            )
+            pdfmetrics.registerFont(TTFont('Vazirmatn-Medium', medium_path))
         return True
     except Exception as ex:
-        print(f"❌ خطای فونت: {ex}")
+        print(f"خطای فونت: {ex}")
         return False
-
 
 def get_jalali_date():
     try:

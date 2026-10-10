@@ -15,7 +15,11 @@ backups/
 
 EasyOCR_models/
 Tesseract-OCR/
-
+# فایل‌های زیپ مدل‌ها (توی Release آپلود شدن)
+EasyOCR_models.zip
+Tesseract-OCR.zip
+Tesseract-OCR-Lite.zip
+Tesseract-Lite/
 # اطلاعات کاربر
 uploads/
 reports/

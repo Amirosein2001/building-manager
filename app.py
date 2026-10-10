@@ -7406,11 +7406,30 @@ async def main(page: ft.Page):
         # ═══  PDF دوره  ═══
         # ═══════════════════════════════════
         def export_period_pdf(period):
+            import traceback
+            # مسیر لاگ — کنار exe یا کنار app.py
+            if getattr(sys, 'frozen', False):
+                log_dir = os.path.dirname(sys.executable)
+            else:
+                log_dir = os.path.dirname(os.path.abspath(__file__))
+            log_file = os.path.join(log_dir, "pdf_error.log")
+
+            def _log(msg):
+                try:
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write(str(msg) + "\n")
+                except Exception:
+                    pass
+
             try:
+                _log(f"=== شروع PDF برای دوره: {period} ===")
+
                 from pdf_generator import generate_period_report_pdf
                 from database import SessionLocal
                 from models import Charge, Payment, Unit
                 from collections import defaultdict
+
+                _log("imports ok")
 
                 b_info = get_building_info()
                 bank_info = {
@@ -7437,15 +7456,13 @@ async def main(page: ft.Page):
                         all_charges = db.query(Charge).filter(
                             Charge.unit_id.in_(unit_ids)
                         ).order_by(
-                            Charge.created_at.asc(),
-                            Charge.id.asc()
+                            Charge.created_at.asc(), Charge.id.asc()
                         ).all()
 
                         all_payments = db.query(Payment).filter(
                             Payment.unit_id.in_(unit_ids)
                         ).order_by(
-                            Payment.payment_date.asc(),
-                            Payment.id.asc()
+                            Payment.payment_date.asc(), Payment.id.asc()
                         ).all()
 
                         charges_by_unit = defaultdict(list)
@@ -7461,28 +7478,21 @@ async def main(page: ft.Page):
                         for uid in unit_ids:
                             unit_charges = charges_by_unit[uid]
                             unit_payments = payments_by_unit[uid]
-
-                            remaining = {
-                                c.id: float(c.amount or 0)
-                                for c in unit_charges
-                            }
+                            remaining = {c.id: float(c.amount or 0) for c in unit_charges}
 
                             for p in unit_payments:
                                 amt = float(p.amount or 0)
                                 first_hit_charge_id = None
-
                                 for c in unit_charges:
                                     if remaining[c.id] <= 0:
                                         continue
                                     if first_hit_charge_id is None:
                                         first_hit_charge_id = c.id
-
                                     use = min(amt, remaining[c.id])
                                     remaining[c.id] -= use
                                     amt -= use
                                     if amt <= 0:
                                         break
-
                                 if first_hit_charge_id in period_charge_ids:
                                     period_payment_ids.add(p.id)
 
@@ -7491,14 +7501,11 @@ async def main(page: ft.Page):
                                 Unit, Payment.unit_id == Unit.id
                             ).filter(
                                 Payment.id.in_(period_payment_ids)
-                            ).order_by(
-                                Payment.payment_date.asc()
-                            ).all()
+                            ).order_by(Payment.payment_date.asc()).all()
 
                             period_payments = [
                                 {
-                                    "id": pay.id,
-                                    "unit_id": pay.unit_id,
+                                    "id": pay.id, "unit_id": pay.unit_id,
                                     "unit_number": u.number,
                                     "resident_name": u.resident_name,
                                     "amount": pay.amount,
@@ -7511,6 +7518,8 @@ async def main(page: ft.Page):
                                 }
                                 for pay, u in matched_rows
                             ]
+
+                _log(f"payments: {len(period_payments)}")
 
                 report_data = {
                     "period": period,
@@ -7528,6 +7537,8 @@ async def main(page: ft.Page):
                     },
                 }
 
+                _log("calling generate_period_report_pdf")
+
                 result = generate_period_report_pdf(
                     report_data=report_data,
                     building_name=b_info["name"],
@@ -7542,22 +7553,29 @@ async def main(page: ft.Page):
                     theme_color=theme_color,
                 )
 
+                _log(f"result: {result}")
+
                 if result["success"]:
-                    msg("✅ PDF ساخته شد.", S)
+                    msg("PDF ساخته شد.", S)
                     try:
                         os.startfile(result["path"])
                     except Exception:
-                        try:
-                            import subprocess
-                            subprocess.Popen(["xdg-open", result["path"]])
-                        except Exception:
-                            pass
+                        pass
                 else:
-                    msg(f"❌ {result['message']}", D)
+                    msg(f"{result.get('message', 'خطا')}", D)
+                    _log(f"PDF failed: {result.get('message')}")
+
             except ImportError as ex:
-                msg(f"❌ pdf_generator مشکل داره: {ex}", D)
+                _log(f"ImportError: {ex}")
+                _log(traceback.format_exc())
+                msg(f"pdf_generator مشکل داره: {ex}", D)
             except Exception as ex:
+                _log(f"Exception: {ex}")
+                _log(traceback.format_exc())
                 msg(f"خطا: {ex}", D)
+
+
+                
                 import traceback
                 traceback.print_exc()
 
