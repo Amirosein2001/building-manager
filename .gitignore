@@ -1,0 +1,81 @@
+# ═══════════ اطلاعات حساس — هرگز آپلود نشوند ═══════════
+# دیتابیس اصلی
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+building_manager.db
+
+# بکاپ‌ها
+backups/
+*.bak
+*.backup
+
+EasyOCR_models/
+Tesseract-OCR/
+
+# اطلاعات کاربر
+uploads/
+reports/
+temp_charts/
+simplerecp/
+logos/
+
+# رمزها و تنظیمات محلی
+.env
+*.env
+config.ini
+secrets.json
+
+# فایل‌های تست با رمز (این‌ها رمز SMSGate دارن)
+test_gate.py
+test_sms.py
+test_integration.py
+
+# فایل‌های تست و دیباگ
+ground_truth.json
+parser_results.json
+debug_preprocess_output/
+*.log
+
+# ═══════════ Python ═══════════
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+.venv/
+.venv311/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ═══════════ IDE ═══════════
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-*
+
+# ═══════════ OS ═══════════
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ═══════════ exe و installer ═══════════
+*.exe
+*.msi
+installer_output/
+
+# ═══════════ Build artifacts ═══════════
+*.spec
+BuildingManager.spec
