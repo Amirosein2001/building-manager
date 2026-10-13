@@ -156,10 +156,10 @@ building_manager/
 
 ## 👤 توسعه‌دهنده
 
-**[نام و نام خانوادگی تو]**
+**[AmirEP]**
 
-- 🔗 گیت‌هاب: [@USERNAME](https://github.com/USERNAME)
-- 📧 ایمیل: your-email@example.com
+- 🔗 گیت‌هاب : https://github.com/Amirosein2001
+- 📧 ایمیل: Amirep2001@gmail.com
 
 ---
 
