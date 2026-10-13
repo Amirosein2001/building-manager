@@ -32,6 +32,144 @@ MONTHS = [
 ]
 
 
+# ═══════════ سیستم Multi-Building ═══════════
+
+def _get_active_building_id():
+    """گرفتن ID ساختمون فعال از تنظیمات"""
+    try:
+        bid = get_setting("active_building_id", "")
+        if bid and str(bid).strip():
+            return int(bid)
+    except Exception:
+        pass
+    return None
+
+
+def set_active_building(building_id):
+    """تنظیم ساختمون فعال"""
+    set_setting("active_building_id", str(building_id))
+
+
+def list_buildings():
+    """لیست همه ساختمان‌ها"""
+    with SessionLocal() as db:
+        buildings = db.query(Building).order_by(Building.id.asc()).all()
+        active_id = _get_active_building_id()
+        return [
+            {
+                "id": b.id,
+                "name": b.name,
+                "address": b.address or "",
+                "floors": b.floors or 0,
+                "total_units": b.total_units or 0,
+                "is_active": (b.id == active_id),
+            }
+            for b in buildings
+        ]
+
+
+def add_building(name, address="", floors=0, total_units=0):
+    """اضافه کردن ساختمان جدید"""
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("نام ساختمان الزامی است.")
+
+    with SessionLocal() as db:
+        building = Building(
+            name=name,
+            address=str(address or "").strip(),
+            floors=int(floors or 0),
+            total_units=int(total_units or 0),
+        )
+        db.add(building)
+        db.commit()
+        db.refresh(building)
+        return building.id
+
+
+def update_building_by_id(building_id, name, address="", floors=0, total_units=0):
+    """ویرایش ساختمان"""
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("نام ساختمان الزامی است.")
+
+    with SessionLocal() as db:
+        b = db.query(Building).filter(
+            Building.id == int(building_id)
+        ).first()
+        if not b:
+            raise ValueError("ساختمان پیدا نشد.")
+        b.name = name
+        b.address = str(address or "").strip()
+        b.floors = int(floors or 0)
+        b.total_units = int(total_units or 0)
+        db.commit()
+        return True
+
+
+def delete_building(building_id):
+    """حذف ساختمان و همه‌ی داده‌های مرتبط"""
+    with SessionLocal() as db:
+        b = db.query(Building).filter(
+            Building.id == int(building_id)
+        ).first()
+        if not b:
+            raise ValueError("ساختمان پیدا نشد.")
+
+        count = db.query(Building).count()
+        if count <= 1:
+            raise ValueError("نمی‌توان آخرین ساختمان را حذف کرد.")
+
+        # حذف واحدها (که Charge/Payment از طریق cascade پاک می‌شن)
+        units = db.query(Unit).filter(Unit.building_id == b.id).all()
+        for u in units:
+            db.delete(u)
+
+        # حذف قبوض
+        bills = db.query(UtilityBill).filter(
+            UtilityBill.building_id == b.id
+        ).all()
+        for bill in bills:
+            db.delete(bill)
+
+        # حذف هزینه‌ها
+        expenses = db.query(Expense).filter(
+            Expense.building_id == b.id
+        ).all()
+        for e in expenses:
+            db.delete(e)
+
+        db.delete(b)
+        db.commit()
+
+        # اگه ساختمون فعال بود، یه ساختمون دیگه رو active کن
+        active_id = _get_active_building_id()
+        if active_id == int(building_id):
+            first = db.query(Building).first()
+            if first:
+                set_active_building(first.id)
+
+        return True
+
+
+def switch_building(building_id):
+    """سوییچ به ساختمان دیگه"""
+    with SessionLocal() as db:
+        b = db.query(Building).filter(
+            Building.id == int(building_id)
+        ).first()
+        if not b:
+            raise ValueError("ساختمان پیدا نشد.")
+        set_active_building(b.id)
+        return True
+
+
+def count_buildings():
+    """تعداد ساختمان‌ها"""
+    with SessionLocal() as db:
+        return db.query(Building).count()
+
+
 def to_jalali(d):
     if d is None:
         return ""
@@ -190,6 +328,15 @@ def _bill_sort_key(bill):
 # ───────── ساختمان ─────────
 
 def _get_or_create_building(db):
+    """گرفتن ساختمون فعال (یا ساخت اولین ساختمون)"""
+    active_id = _get_active_building_id()
+    if active_id:
+        b = db.query(Building).filter(
+            Building.id == active_id
+        ).first()
+        if b:
+            return b
+
     building = db.query(Building).first()
     if not building:
         building = Building(
@@ -199,6 +346,23 @@ def _get_or_create_building(db):
         db.add(building)
         db.commit()
         db.refresh(building)
+
+    # inline: تنظیم active بدون session جدید
+    try:
+        row = db.query(AppSetting).filter(
+            AppSetting.key == "active_building_id"
+        ).first()
+        if row:
+            row.value = str(building.id)
+        else:
+            db.add(AppSetting(
+                key="active_building_id",
+                value=str(building.id),
+            ))
+        db.commit()
+    except Exception:
+        pass
+
     return building
 
 
@@ -326,7 +490,10 @@ def get_unit_by_id(unit_id):
 
 def list_units_basic():
     with SessionLocal() as db:
-        units = db.query(Unit).order_by(
+        building = _get_or_create_building(db)
+        units = db.query(Unit).filter(
+            Unit.building_id == building.id
+        ).order_by(
             Unit.floor.asc(), Unit.number.asc()
         ).all()
         return [
@@ -343,7 +510,10 @@ def list_units_basic():
 
 def list_units_with_debt():
     with SessionLocal() as db:
-        units = db.query(Unit).order_by(
+        building = _get_or_create_building(db)
+        units = db.query(Unit).filter(
+            Unit.building_id == building.id
+        ).order_by(
             Unit.floor.asc(), Unit.number.asc()
         ).all()
         result = []
@@ -425,8 +595,11 @@ def generate_monthly_charges(period, method, value,
 
 def list_charges(period=None):
     with SessionLocal() as db:
+        building = _get_or_create_building(db)
         query = db.query(Charge, Unit).join(
             Unit, Charge.unit_id == Unit.id
+        ).filter(
+            Unit.building_id == building.id
         ).order_by(
             Charge.period.desc(),
             Unit.floor.asc(),
@@ -444,10 +617,7 @@ def list_charges(period=None):
                 (charge.paid_amount or 0), 0
             )
 
-            # ⭐ بدهی قبلی: مجموع باقی‌مانده‌ی دوره‌های قبل‌تر
-            # نکته: قبلاً بر اساس created_at مقایسه می‌شد که اشتباه بود
-            # (چون شارژها اغلب یک‌جا وارد می‌شوند و created_at یکسان دارند).
-            # الان بر اساس ترتیب واقعی دوره (سال، ماه) محاسبه می‌شود.
+            # بدهی قبلی: مجموع باقی‌مانده‌ی دوره‌های قبل‌تر
             current_key = _period_sort_key(charge.period)
             older_charges = db.query(Charge).filter(
                 Charge.unit_id == unit.id,
@@ -484,11 +654,15 @@ def list_charges(period=None):
 
 def get_charge_periods():
     with SessionLocal() as db:
-        rows = db.query(Charge.period).distinct().order_by(
+        building = _get_or_create_building(db)          # ← ⭐ جدید
+        rows = db.query(Charge.period).join(
+            Unit, Charge.unit_id == Unit.id             # ← ⭐ جدید
+        ).filter(
+            Unit.building_id == building.id             # ← ⭐ جدید
+        ).distinct().order_by(
             Charge.period.desc()
         ).all()
         return [r[0] for r in rows]
-
 
 def delete_charge(charge_id):
     with SessionLocal() as db:
@@ -709,8 +883,11 @@ def add_payment(unit_id, amount, payment_date=None,
 
 def list_payments():
     with SessionLocal() as db:
+        building = _get_or_create_building(db)
         rows = db.query(Payment, Unit).join(
             Unit, Payment.unit_id == Unit.id
+        ).filter(
+            Unit.building_id == building.id
         ).order_by(Payment.created_at.desc()).all()
         return [
             {
@@ -786,7 +963,9 @@ def add_expense(title, category, amount,
         raise ValueError("مبلغ هزینه باید بیشتر از صفر باشد.")
     e_date = parse_date(expense_date) or date.today()
     with SessionLocal() as db:
+        building = _get_or_create_building(db)
         expense = Expense(
+            building_id=building.id,
             title=title,
             category=category or "سایر",
             amount=amount,
@@ -856,7 +1035,10 @@ def get_expense_by_id(expense_id):
 
 def list_expenses():
     with SessionLocal() as db:
-        expenses = db.query(Expense).order_by(
+        building = _get_or_create_building(db)
+        expenses = db.query(Expense).filter(
+            Expense.building_id == building.id
+        ).order_by(
             Expense.created_at.desc()
         ).all()
         return [
@@ -872,7 +1054,10 @@ def list_expenses():
 
 def list_expenses_by_month():
     with SessionLocal() as db:
-        expenses = db.query(Expense).order_by(
+        building = _get_or_create_building(db)
+        expenses = db.query(Expense).filter(
+            Expense.building_id == building.id
+        ).order_by(
             Expense.expense_date.desc()
         ).all()
 
@@ -925,8 +1110,10 @@ def delete_expense(expense_id):
 def get_last_bill_reading(bill_type):
     """قرائت فعلی آخرین قبض همان نوع را برمی‌گرداند"""
     with SessionLocal() as db:
+        building = _get_or_create_building(db)          # ← ⭐ جدید
         last = db.query(UtilityBill).filter(
-            UtilityBill.bill_type == bill_type
+            UtilityBill.building_id == building.id,     # ← ⭐ جدید
+            UtilityBill.bill_type == bill_type,
         ).order_by(
             UtilityBill.created_at.desc()
         ).first()
@@ -1032,7 +1219,6 @@ def add_utility_bill(bill_type, bill_identifier,
 
         # ═══════════ ثبت خودکار در هزینه‌ها ═══════════
         try:
-            # تبدیل مبلغ از ریال به تومان (اگه واحد پول تومان باشه)
             expense_amount = amt / 10 if amt else 0
 
             expense_title = (
@@ -1047,14 +1233,12 @@ def add_utility_bill(bill_type, bill_identifier,
                 if consumption else ""
             )
 
-            # ⭐ محاسبه تاریخ هزینه از period اگه تاریخ دیگه‌ای نبود
             expense_date_value = (
-                    parse_date(due_date)
-                    or parse_date(issue_date)
+                parse_date(due_date)
+                or parse_date(issue_date)
             )
 
             if expense_date_value is None and period:
-                # تبدیل "مهر 1403" به تاریخ 1403/07/01 میلادی
                 try:
                     period_parts = str(period).strip().split()
                     if len(period_parts) >= 2:
@@ -1073,6 +1257,7 @@ def add_utility_bill(bill_type, bill_identifier,
                 expense_date_value = date.today()
 
             expense = Expense(
+                building_id=building.id,   # ⭐⭐ FIX
                 title=expense_title.strip(),
                 category=bill_type,
                 amount=expense_amount,
@@ -1083,18 +1268,18 @@ def add_utility_bill(bill_type, bill_identifier,
             db.commit()
             db.refresh(expense)
 
-            # ذخیره ID هزینه در قبض
             bill.related_expense_id = expense.id
             db.commit()
 
             print(
                 f"✅ هزینه خودکار ثبت شد "
-                f"(ID: {expense.id})"
+                f"(ID: {expense.id}, building_id: {building.id})"
             )
         except Exception as ex:
             print(f"⚠️ خطای ثبت هزینه خودکار: {ex}")
 
         return bill
+
 def add_utility_bill_new(
     bill_type, bill_identifier,
     pay_identifier, period,
@@ -1108,7 +1293,7 @@ def add_utility_bill_new(
     meter_number="", file_number="",
     city="", capacity=0,
     bill_date="", check_duplicate=True,
-    expense_date_override=None,   # ⭐ تاریخ هزینه دلخواه
+    expense_date_override=None,
 ):
     """مثل add_utility_bill ولی تاریخ هزینه رو دستی می‌گیره"""
     bill_type = str(bill_type or "").strip()
@@ -1181,13 +1366,16 @@ def add_utility_bill_new(
         # ─── ثبت خودکار در هزینه‌ها ───
         try:
             expense_amount = amt / 10 if amt else 0
-            expense_title = f"قبض {bill_type} - {period or bill_date or ''}"
+            expense_title = (
+                f"قبض {bill_type} - "
+                f"{period or bill_date or ''}"
+            )
             expense_desc = (
-                f"مصرف: {consumption:.0f} {consumption_unit} در {days} روز"
+                f"مصرف: {consumption:.0f} "
+                f"{consumption_unit} در {days} روز"
                 if consumption else ""
             )
 
-            # ⭐ استفاده از تاریخ هزینه کاربر
             if expense_date_override is not None:
                 expense_date_value = expense_date_override
             else:
@@ -1198,6 +1386,7 @@ def add_utility_bill_new(
                 )
 
             expense = Expense(
+                building_id=building.id,   # ⭐⭐ FIX
                 title=expense_title.strip(),
                 category=bill_type,
                 amount=expense_amount,
@@ -1210,25 +1399,29 @@ def add_utility_bill_new(
 
             bill.related_expense_id = expense.id
             db.commit()
-            print(f"✅ هزینه خودکار ثبت شد (ID: {expense.id})")
+
+            print(
+                f"✅ هزینه خودکار ثبت شد "
+                f"(ID: {expense.id}, building_id: {building.id})"
+            )
         except Exception as ex:
             print(f"⚠️ خطای ثبت هزینه خودکار: {ex}")
 
         return bill
 
-
-
 def list_utility_bills(bill_type=None):
     with SessionLocal() as db:
-        query = db.query(UtilityBill)
+        building = _get_or_create_building(db)
+        query = db.query(UtilityBill).filter(
+            UtilityBill.building_id == building.id
+        )
         if bill_type and str(bill_type).strip():
             query = query.filter(
                 UtilityBill.bill_type == str(bill_type).strip()
             )
         bills = query.all()
 
-        # ⭐ مرتب‌سازی بر اساس ترتیب واقعی ماه‌های شمسی
-        # (نه created_at که برای قبوض دستی باعث می‌شد آخر لیست بیفتند)
+        # مرتب‌سازی بر اساس ترتیب واقعی ماه‌های شمسی
         bills = sorted(bills, key=_bill_sort_key)
 
         return [
@@ -1264,20 +1457,14 @@ def list_utility_bills(bill_type=None):
             }
             for b in bills
         ]
-
 def get_consumption_chart_data(bill_type):
     with SessionLocal() as db:
+        building = _get_or_create_building(db)
         bills = db.query(UtilityBill).filter(
-            UtilityBill.bill_type == str(
-                bill_type
-            ).strip()
+            UtilityBill.building_id == building.id,
+            UtilityBill.bill_type == str(bill_type).strip()
         ).all()
 
-        # ⭐ مرتب‌سازی بر اساس ترتیب واقعی دوره (ماه شمسی)
-        # نکته: قبلاً از order_by(from_date.asc().nulls_last()) استفاده
-        # می‌شد که برای قبوض دستی (without from_date) اشتباه بود و
-        # اون‌ها رو آخر لیست می‌انداخت. الان از همون _bill_sort_key
-        # استفاده می‌کنیم که توی list_utility_bills هم به کار رفت.
         bills = sorted(bills, key=_bill_sort_key)
 
         return [
@@ -1430,49 +1617,16 @@ def _generate_test_bill_data(bill_id, bill_type):
 
 
 def get_bills_summary_by_period():
-    """
-    خلاصه قبوض به تفکیک ماه و کل
-
-    Returns:
-        {
-            "monthly": {
-                "مرداد 1404": {
-                    "آب": 100000,
-                    "برق": 200000,
-                    "گاز": 50000,
-                    "total": 350000
-                },
-                ...
-            },
-            "yearly": {
-                "1404": {
-                    "آب": 500000,
-                    "برق": 800000,
-                    "گاز": 300000,
-                    "total": 1600000
-                }
-            },
-            "all_time": {
-                "آب": 1000000,
-                "برق": 1500000,
-                "گاز": 600000,
-                "total": 3100000
-            }
-        }
-    """
+    """خلاصه قبوض به تفکیک ماه و کل (فقط ساختمون فعال)"""
     with SessionLocal() as db:
-        bills = db.query(UtilityBill).order_by(
-            UtilityBill.issue_date.asc().nulls_last()
-        ).all()
+        building = _get_or_create_building(db)
+        bills = db.query(UtilityBill).filter(
+            UtilityBill.building_id == building.id
+        ).order_by(UtilityBill.issue_date.asc().nulls_last()).all()
 
         monthly = {}
         yearly = {}
-        all_time = {
-            "آب": 0,
-            "برق": 0,
-            "گاز": 0,
-            "total": 0
-        }
+        all_time = {"آب": 0, "برق": 0, "گاز": 0, "total": 0}
 
         for b in bills:
             bill_type = b.bill_type
@@ -1481,19 +1635,15 @@ def get_bills_summary_by_period():
             if bill_type not in ["آب", "برق", "گاز"]:
                 continue
 
-            # تعیین ماه و سال
             period = ""
             year = ""
 
             if b.issue_date:
-                j = jdatetime.date.fromgregorian(
-                    date=b.issue_date
-                )
+                j = jdatetime.date.fromgregorian(date=b.issue_date)
                 period = f"{MONTHS[j.month]} {j.year}"
                 year = str(j.year)
             elif b.period:
                 period = b.period
-                # استخراج سال از دوره
                 parts = b.period.split()
                 if len(parts) >= 2:
                     year = parts[-1]
@@ -1502,46 +1652,34 @@ def get_bills_summary_by_period():
                 period = "نامشخص"
                 year = "نامشخص"
 
-            # ماهانه
             if period not in monthly:
-                monthly[period] = {
-                    "آب": 0,
-                    "برق": 0,
-                    "گاز": 0,
-                    "total": 0
-                }
+                monthly[period] = {"آب": 0, "برق": 0, "گاز": 0, "total": 0}
             monthly[period][bill_type] += amount
             monthly[period]["total"] += amount
 
-            # سالانه
             if year not in yearly:
-                yearly[year] = {
-                    "آب": 0,
-                    "برق": 0,
-                    "گاز": 0,
-                    "total": 0
-                }
+                yearly[year] = {"آب": 0, "برق": 0, "گاز": 0, "total": 0}
             yearly[year][bill_type] += amount
             yearly[year]["total"] += amount
 
-            # کل
             all_time[bill_type] += amount
             all_time["total"] += amount
 
-        return {
-            "monthly": monthly,
-            "yearly": yearly,
-            "all_time": all_time
-        }
+        return {"monthly": monthly, "yearly": yearly, "all_time": all_time}
+
+
 def check_duplicate_bill(bill_type, from_date=None,
                          to_date=None, bill_identifier=None,
                          period=None):
     """
-    بررسی وجود قبض تکراری
+    بررسی وجود قبض تکراری (فقط در ساختمون فعال)
     """
     with SessionLocal() as db:
+        building = _get_or_create_building(db)          # ← ⭐ جدید
+
         query = db.query(UtilityBill).filter(
-            UtilityBill.bill_type == bill_type
+            UtilityBill.building_id == building.id,     # ← ⭐ جدید
+            UtilityBill.bill_type == bill_type,
         )
 
         # چک بر اساس شناسه قبض + تاریخ‌ها
@@ -1553,7 +1691,6 @@ def check_duplicate_bill(bill_type, from_date=None,
             ).all()
 
             for bill in existing:
-                # اگه تاریخ صدور یکسان باشه
                 if from_date and to_date:
                     from_d = parse_date(from_date)
                     to_d = parse_date(to_date)
@@ -1587,40 +1724,26 @@ def check_duplicate_bill(bill_type, from_date=None,
         return {"exists": False}
 
 def get_bill_stats(bill_type):
-    """آمار و گزارش قبوض یک نوع خاص"""
+    """آمار قبوض یک نوع خاص (فقط ساختمون فعال)"""
     with SessionLocal() as db:
+        building = _get_or_create_building(db)
         bills = db.query(UtilityBill).filter(
+            UtilityBill.building_id == building.id,
             UtilityBill.bill_type == bill_type
         ).all()
 
         if not bills:
             return None
 
-        total_cons = sum(
-            b.consumption or 0 for b in bills
-        )
+        total_cons = sum(b.consumption or 0 for b in bills)
         total_amt = sum(b.amount or 0 for b in bills)
-        avg_monthly_cons = (
-            total_cons / len(bills) if bills else 0
-        )
-        avg_monthly_amt = (
-            total_amt / len(bills) if bills else 0
-        )
+        avg_monthly_cons = total_cons / len(bills) if bills else 0
+        avg_monthly_amt = total_amt / len(bills) if bills else 0
 
-        max_cons = max(
-            (b.consumption or 0 for b in bills),
-            default=0
-        )
-        min_cons = min(
-            (b.consumption or 0 for b in bills),
-            default=0
-        )
-        max_amt = max(
-            (b.amount or 0 for b in bills), default=0
-        )
-        min_amt = min(
-            (b.amount or 0 for b in bills), default=0
-        )
+        max_cons = max((b.consumption or 0 for b in bills), default=0)
+        min_cons = min((b.consumption or 0 for b in bills), default=0)
+        max_amt = max((b.amount or 0 for b in bills), default=0)
+        min_amt = min((b.amount or 0 for b in bills), default=0)
 
         return {
             "count": len(bills),
@@ -1636,67 +1759,42 @@ def get_bill_stats(bill_type):
 
 
 def get_all_bills_summary():
-    """
-    خلاصه کل قبوض (آب، برق، گاز)
-    برای نمایش در گزارش مالی
-    """
+    """خلاصه کل قبوض (فقط ساختمون فعال)"""
     with SessionLocal() as db:
+        building = _get_or_create_building(db)
         summary = {
-            "آب": {
-                "count": 0,
-                "total_amount": 0,
-                "total_consumption": 0
-            },
-            "برق": {
-                "count": 0,
-                "total_amount": 0,
-                "total_consumption": 0
-            },
-            "گاز": {
-                "count": 0,
-                "total_amount": 0,
-                "total_consumption": 0
-            },
+            "آب": {"count": 0, "total_amount": 0, "total_consumption": 0},
+            "برق": {"count": 0, "total_amount": 0, "total_consumption": 0},
+            "گاز": {"count": 0, "total_amount": 0, "total_consumption": 0},
         }
 
         for bill_type in summary.keys():
             bills = db.query(UtilityBill).filter(
+                UtilityBill.building_id == building.id,
                 UtilityBill.bill_type == bill_type
             ).all()
 
             summary[bill_type]["count"] = len(bills)
-            summary[bill_type]["total_amount"] = sum(
-                b.amount or 0 for b in bills
-            )
-            summary[bill_type]["total_consumption"] = sum(
-                b.consumption or 0 for b in bills
-            )
+            summary[bill_type]["total_amount"] = sum(b.amount or 0 for b in bills)
+            summary[bill_type]["total_consumption"] = sum(b.consumption or 0 for b in bills)
 
-        # جمع کل
         summary["total_all"] = sum(
-            summary[t]["total_amount"]
-            for t in ["آب", "برق", "گاز"]
+            summary[t]["total_amount"] for t in ["آب", "برق", "گاز"]
         )
-
         return summary
 
 
 def get_bills_by_period(bill_type):
-    """
-    قبوض یک نوع خاص گروه‌بندی شده بر اساس دوره
-    """
     with SessionLocal() as db:
+        building = _get_or_create_building(db)
         bills = db.query(UtilityBill).filter(
+            UtilityBill.building_id == building.id,
             UtilityBill.bill_type == bill_type
-        ).order_by(
-            UtilityBill.from_date.asc().nulls_last()
-        ).all()
+        ).order_by(UtilityBill.from_date.asc().nulls_last()).all()
 
         return [
             {
-                "period": b.period or (
-                    b.bill_date or "-"
-                ),
+                "period": b.period or (b.bill_date or "-"),
                 "amount": b.amount or 0,
                 "consumption": b.consumption or 0,
                 "issue_date": b.issue_date,
@@ -1708,19 +1806,13 @@ def get_bills_by_period(bill_type):
 # ───────── محاسبه‌گر سهم قبوض ─────────
 
 def calculate_bill_shares(bill_type, total_amount):
-    """
-    محاسبه سهم هر واحد از قبض
-
-    آب: بر اساس نفرات
-    گاز: بر اساس متراژ
-    برق: تقسیم مساوی
-    """
+    """محاسبه سهم هر واحد (فقط ساختمون فعال)"""
     with SessionLocal() as db:
+        building = _get_or_create_building(db)
         units = db.query(Unit).filter(
+            Unit.building_id == building.id,
             Unit.status == "ساکن"
-        ).order_by(
-            Unit.floor.asc(), Unit.number.asc()
-        ).all()
+        ).order_by(Unit.floor.asc(), Unit.number.asc()).all()
 
         if not units:
             return []
@@ -1729,30 +1821,16 @@ def calculate_bill_shares(bill_type, total_amount):
         results = []
 
         if bill_type == "آب":
-            # بر اساس نفرات
-            total_people = sum(
-                u.people_count or 0 for u in units
-            )
+            total_people = sum(u.people_count or 0 for u in units)
             if total_people == 0:
-                # هیچ واحدی نفرات ثبت‌شده نداره → تقسیم مساوی
                 total_people = len(units)
                 fallback_equal = True
             else:
                 fallback_equal = False
 
             for u in units:
-                # نکته: عدد استفاده‌شده برای سهم هر واحد باید
-                # دقیقاً همون عددیه که در مخرج (total_people) جمع
-                # شده، وگرنه مجموع سهم‌ها با مبلغ کل قبض برابر
-                # نمی‌شه (قبلاً برای واحدهای خالی از 1 نفر استفاده
-                # می‌شد در حالی که در مخرج 0 حساب شده بودن)
-                people = (
-                    1 if fallback_equal
-                    else (u.people_count or 0)
-                )
-                share = round(
-                    (total_amount / total_people) * people, 0
-                )
+                people = 1 if fallback_equal else (u.people_count or 0)
+                share = round((total_amount / total_people) * people, 0)
                 results.append({
                     "unit_number": u.number,
                     "resident_name": u.resident_name,
@@ -1763,10 +1841,7 @@ def calculate_bill_shares(bill_type, total_amount):
                 })
 
         elif bill_type == "گاز":
-            # بر اساس متراژ
-            total_area = sum(
-                u.area or 0 for u in units
-            )
+            total_area = sum(u.area or 0 for u in units)
             if total_area == 0:
                 total_area = len(units)
                 fallback_equal = True
@@ -1774,14 +1849,8 @@ def calculate_bill_shares(bill_type, total_amount):
                 fallback_equal = False
 
             for u in units:
-                # همون نکته‌ی بالا: باید با مخرج هم‌خوان باشه
-                area = (
-                    1 if fallback_equal
-                    else (u.area or 0)
-                )
-                share = round(
-                    (total_amount / total_area) * area, 0
-                )
+                area = 1 if fallback_equal else (u.area or 0)
+                share = round((total_amount / total_area) * area, 0)
                 results.append({
                     "unit_number": u.number,
                     "resident_name": u.resident_name,
@@ -1792,10 +1861,8 @@ def calculate_bill_shares(bill_type, total_amount):
                 })
 
         else:
-            # برق: تقسیم مساوی
             count = len(units)
             share = round(total_amount / count, 0)
-
             for u in units:
                 results.append({
                     "unit_number": u.number,
@@ -1812,21 +1879,13 @@ def calculate_bill_shares(bill_type, total_amount):
 # ───────── صدور خودکار شارژ ─────────
 
 def check_and_auto_generate_charge():
-    """
-    بررسی و صدور خودکار شارژ ماه جاری
-    اگه تنظیم شده باشه و ماه جاری صادر نشده باشه
-    """
-    # چک تنظیمات
-    auto_enabled = get_setting(
-        "auto_charge_enabled", "0"
-    )
+    """بررسی و صدور خودکار شارژ ماه جاری (فقط ساختمون فعال)"""
+    auto_enabled = _bs("auto_charge_enabled", "0")
     if auto_enabled != "1":
         return None
 
-    method = get_setting(
-        "auto_charge_method", "manual"
-    )
-    value = get_setting("auto_charge_value", "0")
+    method = _bs("auto_charge_method", "manual")
+    value = _bs("auto_charge_value", "0")
 
     try:
         rate = float(value or 0)
@@ -1836,20 +1895,27 @@ def check_and_auto_generate_charge():
     if rate <= 0:
         return None
 
-    # دوره فعلی
     j = jdatetime.date.today()
     current_period = f"{MONTHS[j.month]} {j.year}"
 
-    # چک اینکه آیا قبلاً صادر شده
     with SessionLocal() as db:
-        existing = db.query(Charge).filter(
-            Charge.period == current_period
-        ).first()
+        building = _get_or_create_building(db)
+        # ⭐ فقط واحدهای این ساختمون
+        unit_ids = [
+            u.id for u in db.query(Unit.id).filter(
+                Unit.building_id == building.id
+            ).all()
+        ]
 
-        if existing:
-            return None  # قبلاً صادر شده
+        if unit_ids:
+            existing = db.query(Charge).filter(
+                Charge.unit_id.in_(unit_ids),
+                Charge.period == current_period
+            ).first()
 
-    # صدور شارژ
+            if existing:
+                return None
+
     try:
         count = generate_monthly_charges(
             period=current_period,
@@ -1872,8 +1938,8 @@ def send_sms(to, text):
     ارسال پیامک با اپلیکیشن SMSGate روی گوشی اندروید.
     نسخه: android-sms-gateway 4.3.1
     """
-    smsgate_username = get_setting("smsgate_username", "").strip()
-    smsgate_password = get_setting("smsgate_password", "").strip()
+    smsgate_username = _bs("smsgate_username", "").strip()  # ← تغییر
+    smsgate_password = _bs("smsgate_password", "").strip()
 
     if not smsgate_username or not smsgate_password:
         return {
@@ -1946,8 +2012,8 @@ def get_sms_credit():
     """
     چک کردن وضعیت اتصال SMSGate.
     """
-    username = get_setting("smsgate_username", "").strip()
-    password = get_setting("smsgate_password", "").strip()
+    username = _bs("smsgate_username", "").strip()  # ← تغییر
+    password = _bs("smsgate_password", "").strip()
 
     if not username or not password:
         return {
@@ -1976,7 +2042,7 @@ def get_sms_template(template_key, unit_info=None, amount=None):
         building_name = get_building_info().get("name") or "ساختمان"
     except Exception:
         building_name = "ساختمان"
-    bank_card = get_setting("bank_card", "") or "----"
+    bank_card = _bs("bank_card", "") or "----"
 
     # ─── استخراج اطلاعات واحد ───
     unit_name = "کاربر"
@@ -2066,7 +2132,7 @@ def send_payment_thanks_sms(unit, amount, remaining_after=0):
     - remaining_after == 0 → فقط تشکر
     - remaining_after > 0 → تشکر + یادآوری محترمانه
     """
-    if get_setting("sms_thanks_on_payment", "0") != "1":
+    if _bs("sms_thanks_on_payment", "0") != "1":
         return {"sent": False, "reason": "disabled"}
 
     phone = (unit.phone or "").strip()
@@ -2113,29 +2179,64 @@ def set_setting(key, value):
             db.add(row)
         db.commit()
 
+# ═══════════ تنظیمات مخصوص هر ساختمان ═══════════
+
+def _bs(key, default=""):
+    """
+    گرفتن تنظیم مخصوص ساختمون فعال.
+    کلید ذخیره: <key>_b<building_id>
+
+    نکته مهم: اگه مقدار per-building پیدا نشد، default برگردون
+    (نه مقدار global قدیمی) — وگرنه همه ساختمون‌ها یه مقدار
+    مشترک رو نشون می‌دن.
+    """
+    try:
+        bid = _get_active_building_id()
+        if bid is not None:
+            val = get_setting(f"{key}_b{bid}", None)
+            if val is not None and str(val).strip() != "":
+                return val
+            # ⭐ اگه per-building نبود، default رو برگردون
+            return default
+    except Exception:
+        pass
+    return default  # ← نه get_setting(key, default)
+
+
+def _bsset(key, value):
+    """
+    ذخیره تنظیم مخصوص ساختمون فعال.
+    """
+    try:
+        bid = _get_active_building_id()
+        if bid is not None:
+            set_setting(f"{key}_b{bid}", str(value or ""))
+            return
+    except Exception:
+        pass
+    set_setting(key, str(value or ""))
+
 def get_charge_periods_list():
     """لیست همه دوره‌های شارژ (برای فیلتر)"""
     with SessionLocal() as db:
-        periods = db.query(Charge.period).distinct().all()
-        result = [p[0] for p in periods if p[0]]
+        building = _get_or_create_building(db)
+        rows = db.query(Charge.period).join(
+            Unit, Charge.unit_id == Unit.id
+        ).filter(
+            Unit.building_id == building.id
+        ).distinct().all()
+        result = [p[0] for p in rows if p[0]]
         result.sort(reverse=True)  # جدیدترین اول
         return result
 
 def check_and_apply_late_fees():
-    """
-    اعمال جریمه دیرکرد برای شارژهای معوق
-    """
-    late_fee_enabled = get_setting(
-        "late_fee_enabled", "0"
-    )
+    """اعمال جریمه دیرکرد (فقط ساختمون فعال)"""
+    late_fee_enabled = _bs("late_fee_enabled", "0")
     if late_fee_enabled != "1":
         return None
 
     try:
-        fee_amount = float(
-            get_setting("late_fee_amount", "100000")
-            or 100000
-        )
+        fee_amount = float(_bs("late_fee_amount", "100000") or 100000)
     except ValueError:
         fee_amount = 100000
 
@@ -2143,24 +2244,27 @@ def check_and_apply_late_fees():
     applied_count = 0
 
     with SessionLocal() as db:
-        # شارژهای معوق که سررسیدشون گذشته
+        building = _get_or_create_building(db)
+        # ⭐ فقط واحدهای این ساختمون
+        unit_ids = [
+            u.id for u in db.query(Unit.id).filter(
+                Unit.building_id == building.id
+            ).all()
+        ]
+
+        if not unit_ids:
+            return None
+
         charges = db.query(Charge).filter(
-            Charge.status.in_([
-                "پرداخت نشده", "ناقص"
-            ]),
+            Charge.unit_id.in_(unit_ids),
+            Charge.status.in_(["پرداخت نشده", "ناقص"]),
             Charge.due_date < today
         ).all()
 
         for charge in charges:
-            # چک اینکه قبلاً جریمه اعمال شده یا نه
-            if (charge.notes and
-                    "جریمه_دیرکرد" in charge.notes):
+            if charge.notes and "جریمه_دیرکرد" in charge.notes:
                 continue
-
-            # اعمال جریمه
-            charge.amount = (
-                (charge.amount or 0) + fee_amount
-            )
+            charge.amount = (charge.amount or 0) + fee_amount
             charge.notes = (
                 (charge.notes or "") +
                 f"|جریمه_دیرکرد:{fee_amount:.0f}"
@@ -2170,37 +2274,42 @@ def check_and_apply_late_fees():
         db.commit()
 
     if applied_count > 0:
-        return {
-            "count": applied_count,
-            "fee_amount": fee_amount,
-        }
+        return {"count": applied_count, "fee_amount": fee_amount}
     return None
 
+
 def get_dashboard_advanced_data():
-    """داده‌های پیشرفته داشبورد"""
+    """داده‌های پیشرفته داشبورد (فقط ساختمون فعال)"""
     with SessionLocal() as db:
-        # آمار ماه جاری
+        building = _get_or_create_building(db)
+
+        # ⭐ ID واحدهای این ساختمون
+        unit_ids = [
+            u.id for u in db.query(Unit.id).filter(
+                Unit.building_id == building.id
+            ).all()
+        ]
+
         j = jdatetime.date.today()
         current_period = f"{MONTHS[j.month]} {j.year}"
 
-        # شارژ ماه جاری
-        current_charges = db.query(Charge).filter(
-            Charge.period == current_period
-        ).all()
+        # ─── شارژهای ماه جاری همین ساختمون ───
+        current_charges = []
+        if unit_ids:
+            current_charges = db.query(Charge).filter(
+                Charge.unit_id.in_(unit_ids),
+                Charge.period == current_period
+            ).all()
 
-        current_total = sum(
-            c.amount or 0 for c in current_charges
-        )
-        current_paid = sum(
-            c.paid_amount or 0 for c in current_charges
-        )
+        current_total = sum(c.amount or 0 for c in current_charges)
+        current_paid = sum(c.paid_amount or 0 for c in current_charges)
         current_unpaid = current_total - current_paid
         current_percent = (
             (current_paid / current_total * 100)
             if current_total > 0 else 0
         )
 
-        # ماه قبل
+        # ─── ماه قبل ───
         prev_month = j.month - 1
         prev_year = j.year
         if prev_month == 0:
@@ -2208,37 +2317,34 @@ def get_dashboard_advanced_data():
             prev_year -= 1
         prev_period = f"{MONTHS[prev_month]} {prev_year}"
 
-        prev_charges = db.query(Charge).filter(
-            Charge.period == prev_period
-        ).all()
-        prev_total = sum(
-            c.amount or 0 for c in prev_charges
-        )
-        prev_paid = sum(
-            c.paid_amount or 0 for c in prev_charges
-        )
+        prev_charges = []
+        if unit_ids:
+            prev_charges = db.query(Charge).filter(
+                Charge.unit_id.in_(unit_ids),
+                Charge.period == prev_period
+            ).all()
+        prev_total = sum(c.amount or 0 for c in prev_charges)
+        prev_paid = sum(c.paid_amount or 0 for c in prev_charges)
 
-        # ۶ ماه اخیر (روند دریافتی)
-        from sqlalchemy import func
+        # ─── ۶ ماه اخیر پرداخت‌ها ───
         payments_by_month = {}
-        payments = db.query(Payment).order_by(
-            Payment.payment_date.desc()
-        ).limit(200).all()
+        if unit_ids:
+            payments = db.query(Payment).filter(
+                Payment.unit_id.in_(unit_ids)
+            ).order_by(Payment.payment_date.desc()).limit(200).all()
 
-        for p in payments:
-            if p.payment_date:
-                jp = jdatetime.date.fromgregorian(
-                    date=p.payment_date
-                )
-                key = f"{MONTHS[jp.month]}"
-                if key not in payments_by_month:
-                    payments_by_month[key] = 0
-                payments_by_month[key] += (p.amount or 0)
+            for p in payments:
+                if p.payment_date:
+                    jp = jdatetime.date.fromgregorian(date=p.payment_date)
+                    key = f"{MONTHS[jp.month]}"
+                    if key not in payments_by_month:
+                        payments_by_month[key] = 0
+                    payments_by_month[key] += (p.amount or 0)
 
-        # هزینه‌های اخیر
-        expenses = db.query(Expense).order_by(
-            Expense.created_at.desc()
-        ).limit(5).all()
+        # ─── هزینه‌های اخیر همین ساختمون ───
+        expenses = db.query(Expense).filter(
+            Expense.building_id == building.id
+        ).order_by(Expense.created_at.desc()).limit(5).all()
 
         recent_expenses = [
             {
@@ -2281,20 +2387,35 @@ def get_dashboard_data():
         )
         total_debt = sum(u["debt"] for u in units)
 
-        payments_total = db.query(
-            func.coalesce(func.sum(Payment.amount), 0)
-        ).scalar() or 0
+        unit_ids = [u["id"] for u in units]
 
+        # ─── جمع پرداخت‌های همین ساختمون ───
+        payments_total = 0
+        if unit_ids:
+            payments_total = db.query(
+                func.coalesce(func.sum(Payment.amount), 0)
+            ).filter(
+                Payment.unit_id.in_(unit_ids)
+            ).scalar() or 0
+
+        # ─── جمع شارژهای همین ساختمون ───
+        charges_total = 0
+        if unit_ids:
+            charges_total = db.query(
+                func.coalesce(func.sum(Charge.amount), 0)
+            ).filter(
+                Charge.unit_id.in_(unit_ids)
+            ).scalar() or 0
+
+        # ─── جمع هزینه‌های همین ساختمون ───
         expenses_total = db.query(
             func.coalesce(func.sum(Expense.amount), 0)
-        ).scalar() or 0
-
-        charges_total = db.query(
-            func.coalesce(func.sum(Charge.amount), 0)
+        ).filter(
+            Expense.building_id == building.id
         ).scalar() or 0
 
         initial_balance = float(
-            get_setting("initial_balance", "0") or 0
+            _bs("initial_balance", "0") or 0
         )
 
         cash_balance = (
@@ -2315,7 +2436,6 @@ def get_dashboard_data():
             "initial_balance": initial_balance,
             "cash_balance": cash_balance,
         }
-
 # ═══════════ بکاپ‌گیری از دیتابیس ═══════════
 
 import shutil
@@ -3212,11 +3332,7 @@ def cleanup_old_notifications(days=30):
 # ═══════════ چک خودکار نوتیفیکیشن‌ها ═══════════
 
 def check_and_create_auto_notifications():
-    """
-    چک و ساخت نوتیفیکیشن‌های خودکار:
-    - شارژ سررسید نزدیک
-    - بدهی معوق
-    """
+    """چک و ساخت نوتیفیکیشن‌های خودکار (فقط ساختمون فعال)"""
     from models import Notification, Charge, Unit
     from datetime import timedelta
 
@@ -3225,48 +3341,31 @@ def check_and_create_auto_notifications():
     today = date.today()
 
     with SessionLocal() as db:
-        # ─── شارژهای سررسید نزدیک (3 روز) ─────
+        building = _get_or_create_building(db)
+
+        # ⭐ شارژهای سررسید نزدیک همین ساختمون
         soon_deadline = today + timedelta(days=3)
 
-        near_due_charges = db.query(
-            Charge, Unit
-        ).join(
+        near_due_charges = db.query(Charge, Unit).join(
             Unit, Charge.unit_id == Unit.id
         ).filter(
-            Charge.status.in_([
-                "پرداخت نشده", "ناقص"
-            ]),
+            Unit.building_id == building.id,
+            Charge.status.in_(["پرداخت نشده", "ناقص"]),
             Charge.due_date <= soon_deadline,
             Charge.due_date >= today,
         ).all()
 
         for charge, unit in near_due_charges:
-            # چک تکراری نبودن
-            # نکته: قبلاً اینجا فقط اعلان‌های «نخونده» چک می‌شد
-            # (Notification.is_read == 0). یعنی به محض این‌که کاربر
-            # یه اعلان رو می‌خوند (is_read=1)، در همون شرط هنوز
-            # برقرار بود (شارژ هنوز نزدیک سررسیده)، چرخه‌ی بعدی چک
-            # خودکار دوباره یه نمونه‌ی جدید از همون اعلان می‌ساخت —
-            # دقیقاً همون تکرار مزاحمی که گزارش شده بود. الان فارغ
-            # از خونده/نخونده بودن، اگه قبلاً برای این شارژ یه اعلان
-            # از این نوع ساخته شده باشه، دوباره نمی‌سازیم.
             existing = db.query(Notification).filter(
                 Notification.type == "charge_due",
-                Notification.related_charge_id == (
-                    charge.id
-                ),
+                Notification.related_charge_id == charge.id,
             ).first()
 
             if existing:
                 continue
 
-            days_left = (
-                charge.due_date - today
-            ).days
-
-            title = (
-                f"⏰ شارژ نزدیک به سررسید"
-            )
+            days_left = (charge.due_date - today).days
+            title = "⏰ شارژ نزدیک به سررسید"
             message = (
                 f"شارژ واحد {unit.number} "
                 f"({charge.period}) "
@@ -3288,36 +3387,26 @@ def check_and_create_auto_notifications():
             created.append("charge_due")
             created_items.append({"title": title, "message": message})
 
-        # ─── بدهی معوق ─────
-        overdue_charges = db.query(
-            Charge, Unit
-        ).join(
+        # ─── بدهی معوق همین ساختمون ───
+        overdue_charges = db.query(Charge, Unit).join(
             Unit, Charge.unit_id == Unit.id
         ).filter(
-            Charge.status.in_([
-                "پرداخت نشده", "ناقص"
-            ]),
+            Unit.building_id == building.id,
+            Charge.status.in_(["پرداخت نشده", "ناقص"]),
             Charge.due_date < today,
         ).all()
 
         for charge, unit in overdue_charges:
-            # همون توضیح بالا: چک بدون فیلتر is_read، تا با خوندن
-            # اعلان توسط کاربر، دوباره برای همون شارژ ساخته نشه.
             existing = db.query(Notification).filter(
                 Notification.type == "debt",
-                Notification.related_charge_id == (
-                    charge.id
-                ),
+                Notification.related_charge_id == charge.id,
             ).first()
 
             if existing:
                 continue
 
-            days_overdue = (
-                today - charge.due_date
-            ).days
-
-            title = f"⚠️ بدهی معوق"
+            days_overdue = (today - charge.due_date).days
+            title = "⚠️ بدهی معوق"
             message = (
                 f"واحد {unit.number} "
                 f"({charge.period}) "
@@ -3346,7 +3435,6 @@ def check_and_create_auto_notifications():
         "types": created,
         "items": created_items,
     }
-
 # ═══════════ رمزنگاری رمز عبور برای Remember Me ═══════════
 
 def _get_encryption_key():
@@ -3396,16 +3484,23 @@ def decrypt_text(encrypted_text):
 # ═══════════ اعلان‌های داشبورد ═══════════
 
 def get_dashboard_alerts():
-    """اعلان‌های مهم برای بالای داشبورد"""
-    from models import Charge, Unit, UtilityBill
+    """اعلان‌های مهم برای بالای داشبورد (فقط ساختمون فعال)"""
     from datetime import timedelta
 
     today = date.today()
     alerts = []
 
     with SessionLocal() as db:
-        # بدهکاران
-        units = db.query(Unit).all()
+        building = _get_or_create_building(db)
+
+        # ⭐ فقط واحدهای ساختمون فعال
+        units = db.query(Unit).filter(
+            Unit.building_id == building.id
+        ).all()
+
+        # ⭐ فقط قبض‌های ساختمون فعال
+        # (unitهای قبلی)
+
         debtors_count = 0
         total_debt = 0
 
@@ -3414,10 +3509,7 @@ def get_dashboard_alerts():
                 Charge.unit_id == unit.id
             ).all()
             debt = sum(
-                max(
-                    (c.amount or 0) - (c.paid_amount or 0),
-                    0
-                )
+                max((c.amount or 0) - (c.paid_amount or 0), 0)
                 for c in charges
             )
             if debt > 0:
@@ -3433,52 +3525,50 @@ def get_dashboard_alerts():
                 "action": "units",
             })
 
-        # شارژهای سررسید نزدیک (7 روز)
-        near_deadline = today + timedelta(days=7)
-        near_due = db.query(Charge).filter(
-            Charge.status.in_([
-                "پرداخت نشده", "ناقص"
-            ]),
-            Charge.due_date <= near_deadline,
-            Charge.due_date >= today,
-        ).count()
+        # ⭐ شارژهای این ساختمون
+        unit_ids = [u.id for u in units]
 
-        if near_due > 0:
-            alerts.append({
-                "type": "warning",
-                "icon": "⏰",
-                "title": f"{near_due} شارژ نزدیک سررسید",
-                "value": None,
-                "action": "charges",
-            })
+        if unit_ids:
+            near_deadline = today + timedelta(days=7)
+            near_due = db.query(Charge).filter(
+                Charge.unit_id.in_(unit_ids),
+                Charge.status.in_(["پرداخت نشده", "ناقص"]),
+                Charge.due_date <= near_deadline,
+                Charge.due_date >= today,
+            ).count()
 
-        # سررسید گذشته
-        overdue = db.query(Charge).filter(
-            Charge.status.in_([
-                "پرداخت نشده", "ناقص"
-            ]),
-            Charge.due_date < today,
-        ).count()
+            if near_due > 0:
+                alerts.append({
+                    "type": "warning",
+                    "icon": "⏰",
+                    "title": f"{near_due} شارژ نزدیک سررسید",
+                    "value": None,
+                    "action": "charges",
+                })
 
-        if overdue > 0:
-            alerts.append({
-                "type": "danger",
-                "icon": "🔴",
-                "title": f"{overdue} شارژ معوق",
-                "value": None,
-                "action": "charges",
-            })
+            overdue = db.query(Charge).filter(
+                Charge.unit_id.in_(unit_ids),
+                Charge.status.in_(["پرداخت نشده", "ناقص"]),
+                Charge.due_date < today,
+            ).count()
 
-        # قبض جدید ثبت‌نشده
-        last_bill = db.query(UtilityBill).order_by(
-            UtilityBill.created_at.desc()
-        ).first()
+            if overdue > 0:
+                alerts.append({
+                    "type": "danger",
+                    "icon": "🔴",
+                    "title": f"{overdue} شارژ معوق",
+                    "value": None,
+                    "action": "charges",
+                })
+
+        # ⭐ آخرین قبض همین ساختمون
+        last_bill = db.query(UtilityBill).filter(
+            UtilityBill.building_id == building.id
+        ).order_by(UtilityBill.created_at.desc()).first()
 
         if last_bill:
             from datetime import datetime
-            days_since = (
-                datetime.now() - last_bill.created_at
-            ).days
+            days_since = (datetime.now() - last_bill.created_at).days
             if days_since > 30:
                 alerts.append({
                     "type": "info",
@@ -3503,12 +3593,7 @@ def get_dashboard_alerts():
 # ═══════════ تقویم مالی ═══════════
 
 def get_financial_calendar(days=30):
-    """
-    رویدادهای مالی ۳۰ روز آینده:
-    - سررسید شارژها
-    - سررسید قبض‌ها
-    """
-    from models import Charge, Unit, UtilityBill
+    """رویدادهای مالی ۳۰ روز آینده (فقط ساختمون فعال)"""
     from datetime import timedelta
 
     today = date.today()
@@ -3516,49 +3601,50 @@ def get_financial_calendar(days=30):
     events = []
 
     with SessionLocal() as db:
-        # سررسید شارژها
-        charges = db.query(
-            Charge, Unit
-        ).join(
-            Unit, Charge.unit_id == Unit.id
-        ).filter(
-            Charge.status.in_([
-                "پرداخت نشده", "ناقص"
-            ]),
-            Charge.due_date >= today,
-            Charge.due_date <= end_date,
-        ).all()
+        building = _get_or_create_building(db)
 
-        # گروه‌بندی شارژها بر اساس تاریخ
-        charge_by_date = {}
-        for c, u in charges:
-            d = c.due_date
-            if d not in charge_by_date:
-                charge_by_date[d] = {
-                    "count": 0,
-                    "amount": 0,
-                }
-            charge_by_date[d]["count"] += 1
-            charge_by_date[d]["amount"] += max(
-                (c.amount or 0) - (c.paid_amount or 0),
-                0
-            )
+        # ⭐ ID واحدهای این ساختمون
+        unit_ids = [
+            u.id for u in db.query(Unit.id).filter(
+                Unit.building_id == building.id
+            ).all()
+        ]
 
-        for d, info in charge_by_date.items():
-            days_left = (d - today).days
-            events.append({
-                "type": "charge_due",
-                "date": d,
-                "days_left": days_left,
-                "title": (
-                    f"{info['count']} شارژ سررسید"
-                ),
-                "amount": info["amount"],
-                "icon": "📋",
-            })
+        # ─── سررسید شارژها ───
+        if unit_ids:
+            charges = db.query(Charge, Unit).join(
+                Unit, Charge.unit_id == Unit.id
+            ).filter(
+                Unit.building_id == building.id,
+                Charge.status.in_(["پرداخت نشده", "ناقص"]),
+                Charge.due_date >= today,
+                Charge.due_date <= end_date,
+            ).all()
 
-        # سررسید قبض‌ها
+            charge_by_date = {}
+            for c, u in charges:
+                d = c.due_date
+                if d not in charge_by_date:
+                    charge_by_date[d] = {"count": 0, "amount": 0}
+                charge_by_date[d]["count"] += 1
+                charge_by_date[d]["amount"] += max(
+                    (c.amount or 0) - (c.paid_amount or 0), 0
+                )
+
+            for d, info in charge_by_date.items():
+                days_left = (d - today).days
+                events.append({
+                    "type": "charge_due",
+                    "date": d,
+                    "days_left": days_left,
+                    "title": f"{info['count']} شارژ سررسید",
+                    "amount": info["amount"],
+                    "icon": "📋",
+                })
+
+        # ⭐ سررسید قبض‌ها (همین ساختمون)
         bills = db.query(UtilityBill).filter(
+            UtilityBill.building_id == building.id,
             UtilityBill.due_date >= today,
             UtilityBill.due_date <= end_date,
         ).all()
@@ -3569,9 +3655,7 @@ def get_financial_calendar(days=30):
                 "type": "bill_due",
                 "date": b.due_date,
                 "days_left": days_left,
-                "title": (
-                    f"سررسید قبض {b.bill_type}"
-                ),
+                "title": f"سررسید قبض {b.bill_type}",
                 "amount": b.amount,
                 "icon": (
                     "💧" if b.bill_type == "آب"
@@ -3581,21 +3665,14 @@ def get_financial_calendar(days=30):
                 ),
             })
 
-    # مرتب‌سازی
     events.sort(key=lambda x: x["date"])
-
     return events
 
 
 # ═══════════ پیش‌بینی مالی ═══════════
 
 def get_financial_forecast():
-    """
-    پیش‌بینی مالی ماه آینده:
-    - درآمد پیش‌بینی شده
-    - هزینه‌های ثابت
-    - موجودی نهایی
-    """
+    """پیش‌بینی مالی ماه آینده (فقط ساختمون فعال)"""
     from models import Charge, Expense
     from sqlalchemy import func
     from datetime import timedelta
@@ -3604,52 +3681,45 @@ def get_financial_forecast():
     thirty_days_ago = today - timedelta(days=30)
 
     with SessionLocal() as db:
-        # میانگین درآمد ماه‌های اخیر
-        payments_stats = db.query(
-            func.avg(Charge.amount)
+        building = _get_or_create_building(db)
+
+        # ⭐ ID واحدهای این ساختمون
+        unit_ids = [
+            u.id for u in db.query(Unit.id).filter(
+                Unit.building_id == building.id
+            ).all()
+        ]
+
+        # ⭐ کل شارژ صادره ماه جاری (این ساختمون)
+        current_month_charges = 0
+        if unit_ids:
+            current_month_charges = db.query(
+                func.coalesce(func.sum(Charge.amount), 0)
+            ).filter(
+                Charge.unit_id.in_(unit_ids),
+                Charge.created_at >= thirty_days_ago,
+            ).scalar() or 0
+
+        # ⭐ کل هزینه ماه گذشته (این ساختمون)
+        total_expenses_last_month = db.query(
+            func.coalesce(func.sum(Expense.amount), 0)
         ).filter(
-            Charge.created_at >= thirty_days_ago
+            Expense.building_id == building.id,
+            Expense.expense_date >= thirty_days_ago,
         ).scalar() or 0
 
-        # کل شارژ صادره ماه جاری
-        current_month_charges = db.query(
-            func.coalesce(
-                func.sum(Charge.amount), 0
-            )
-        ).filter(
-            Charge.created_at >= thirty_days_ago
-        ).scalar() or 0
-
-        # میانگین هزینه‌های ماهانه
-        monthly_expenses_avg = db.query(
-            func.avg(Expense.amount)
-        ).filter(
-            Expense.created_at >= thirty_days_ago
-        ).scalar() or 0
-
-        # تعداد هزینه‌های ماه گذشته
+        # ⭐ تعداد هزینه‌های ماه گذشته
         expense_count = db.query(Expense).filter(
-            Expense.expense_date >= thirty_days_ago
+            Expense.building_id == building.id,
+            Expense.expense_date >= thirty_days_ago,
         ).count()
 
-        # کل هزینه ماه گذشته
-        total_expenses_last_month = db.query(
-            func.coalesce(
-                func.sum(Expense.amount), 0
-            )
-        ).filter(
-            Expense.expense_date >= thirty_days_ago
-        ).scalar() or 0
-
-        # موجودی فعلی
+        # موجودی فعلی (از داشبورد)
         current_data = get_dashboard_data()
         current_balance = current_data["cash_balance"]
 
-        # پیش‌بینی
         predicted_income = current_month_charges
-        predicted_expenses = (
-            total_expenses_last_month
-        )
+        predicted_expenses = total_expenses_last_month
         predicted_balance = (
             current_balance
             + predicted_income
@@ -3661,60 +3731,51 @@ def get_financial_forecast():
             "predicted_income": predicted_income,
             "predicted_expenses": predicted_expenses,
             "predicted_balance": predicted_balance,
-            "monthly_expenses_avg": (
-                monthly_expenses_avg
-            ),
+            "monthly_expenses_avg": total_expenses_last_month,
             "expense_count": expense_count,
         }
-
 
 # ═══════════ تایم لاین فعالیت‌ها ═══════════
 
 def get_activity_timeline(limit=10):
-    """
-    آخرین فعالیت‌های ثبت شده:
-    - پرداخت
-    - هزینه
-    - شارژ
-    - قبض
-    """
-    from models import (
-        Payment, Expense, Charge,
-        UtilityBill, Unit
-    )
+    """آخرین فعالیت‌ها (فقط ساختمون فعال)"""
+    from models import Payment, Expense, Charge, UtilityBill, Unit
 
     activities = []
 
     with SessionLocal() as db:
-        # پرداخت‌ها
-        payments = db.query(
-            Payment, Unit
-        ).join(
-            Unit, Payment.unit_id == Unit.id
-        ).order_by(
-            Payment.created_at.desc()
-        ).limit(5).all()
+        building = _get_or_create_building(db)
 
-        for p, u in payments:
-            activities.append({
-                "type": "payment",
-                "icon": "💰",
-                "title": (
-                    f"پرداخت واحد {u.number}"
-                ),
-                "description": (
-                    f"{u.resident_name or '-'} - "
-                    f"{p.payment_method}"
-                ),
-                "amount": p.amount,
-                "color": "success",
-                "timestamp": p.created_at,
-            })
+        # ⭐ ID واحدهای این ساختمون
+        unit_ids = [
+            u.id for u in db.query(Unit.id).filter(
+                Unit.building_id == building.id
+            ).all()
+        ]
 
-        # هزینه‌ها
-        expenses = db.query(Expense).order_by(
-            Expense.created_at.desc()
-        ).limit(5).all()
+        # ─── پرداخت‌ها ───
+        if unit_ids:
+            payments = db.query(Payment, Unit).join(
+                Unit, Payment.unit_id == Unit.id
+            ).filter(
+                Unit.building_id == building.id
+            ).order_by(Payment.created_at.desc()).limit(5).all()
+
+            for p, u in payments:
+                activities.append({
+                    "type": "payment",
+                    "icon": "💰",
+                    "title": f"پرداخت واحد {u.number}",
+                    "description": f"{u.resident_name or '-'} - {p.payment_method}",
+                    "amount": p.amount,
+                    "color": "success",
+                    "timestamp": p.created_at,
+                })
+
+        # ─── هزینه‌ها ───
+        expenses = db.query(Expense).filter(
+            Expense.building_id == building.id
+        ).order_by(Expense.created_at.desc()).limit(5).all()
 
         for e in expenses:
             activities.append({
@@ -3727,43 +3788,39 @@ def get_activity_timeline(limit=10):
                 "timestamp": e.created_at,
             })
 
-        # شارژهای اخیر (فقط دوره‌های منحصر به فرد)
-        charges = db.query(Charge).order_by(
-            Charge.created_at.desc()
-        ).limit(5).all()
+        # ─── شارژها ───
+        if unit_ids:
+            charges = db.query(Charge).filter(
+                Charge.unit_id.in_(unit_ids)
+            ).order_by(Charge.created_at.desc()).limit(5).all()
 
-        seen_periods = set()
-        for c in charges:
-            if c.period in seen_periods:
-                continue
-            seen_periods.add(c.period)
+            seen_periods = set()
+            for c in charges:
+                if c.period in seen_periods:
+                    continue
+                seen_periods.add(c.period)
 
-            # تعداد و جمع شارژهای همون دوره
-            period_charges = db.query(Charge).filter(
-                Charge.period == c.period
-            ).all()
+                period_charges = db.query(Charge).filter(
+                    Charge.period == c.period,
+                    Charge.unit_id.in_(unit_ids),
+                ).all()
 
-            total = sum(
-                pc.amount or 0
-                for pc in period_charges
-            )
+                total = sum(pc.amount or 0 for pc in period_charges)
 
-            activities.append({
-                "type": "charge",
-                "icon": "📋",
-                "title": f"صدور شارژ {c.period}",
-                "description": (
-                    f"{len(period_charges)} واحد"
-                ),
-                "amount": total,
-                "color": "primary",
-                "timestamp": c.created_at,
-            })
+                activities.append({
+                    "type": "charge",
+                    "icon": "📋",
+                    "title": f"صدور شارژ {c.period}",
+                    "description": f"{len(period_charges)} واحد",
+                    "amount": total,
+                    "color": "primary",
+                    "timestamp": c.created_at,
+                })
 
-        # قبض‌ها
-        bills = db.query(UtilityBill).order_by(
-            UtilityBill.created_at.desc()
-        ).limit(3).all()
+        # ─── قبض‌ها ───
+        bills = db.query(UtilityBill).filter(
+            UtilityBill.building_id == building.id
+        ).order_by(UtilityBill.created_at.desc()).limit(3).all()
 
         for b in bills:
             activities.append({
@@ -3774,91 +3831,71 @@ def get_activity_timeline(limit=10):
                     else "🔥" if b.bill_type == "گاز"
                     else "📄"
                 ),
-                "title": (
-                    f"ثبت قبض {b.bill_type}"
-                ),
-                "description": (
-                    f"{b.period or '-'}"
-                ),
+                "title": f"ثبت قبض {b.bill_type}",
+                "description": f"{b.period or '-'}",
                 "amount": (b.amount or 0) / 10,
                 "color": "info",
                 "timestamp": b.created_at,
             })
 
-    # مرتب‌سازی
-    activities.sort(
-        key=lambda x: x["timestamp"], reverse=True
-    )
-
+    activities.sort(key=lambda x: x["timestamp"], reverse=True)
     return activities[:limit]
 
 
 # ═══════════ نمودار روند مالی ═══════════
 
 def get_financial_trend(months=6):
-    """
-    روند مالی ماه‌های اخیر:
-    - درآمد
-    - هزینه
-    - موجودی
-    """
+    """روند مالی ماه‌های اخیر (فقط ساختمون فعال)"""
     from models import Payment, Expense
-    import jdatetime
     from sqlalchemy import func
-
-    MONTHS = [
-        "", "فروردین", "اردیبهشت", "خرداد",
-        "تیر", "مرداد", "شهریور",
-        "مهر", "آبان", "آذر",
-        "دی", "بهمن", "اسفند"
-    ]
 
     trend = []
     today = jdatetime.date.today()
 
     with SessionLocal() as db:
+        building = _get_or_create_building(db)
+
+        # ⭐ ID واحدهای این ساختمون
+        unit_ids = [
+            u.id for u in db.query(Unit.id).filter(
+                Unit.building_id == building.id
+            ).all()
+        ]
+
         for i in range(months - 1, -1, -1):
-            # محاسبه ماه
             target_month = today.month - i
             target_year = today.year
             while target_month <= 0:
                 target_month += 12
                 target_year -= 1
 
-            # اول و آخر ماه
-            j_start = jdatetime.date(
-                target_year, target_month, 1
-            )
-
-            # ماه بعدی
+            j_start = jdatetime.date(target_year, target_month, 1)
             next_m = target_month + 1
             next_y = target_year
             if next_m > 12:
                 next_m = 1
                 next_y += 1
-            j_end = jdatetime.date(
-                next_y, next_m, 1
-            )
+            j_end = jdatetime.date(next_y, next_m, 1)
 
             g_start = j_start.togregorian()
             g_end = j_end.togregorian()
 
-            # جمع پرداخت‌ها
-            income = db.query(
-                func.coalesce(
-                    func.sum(Payment.amount), 0
-                )
-            ).filter(
-                Payment.payment_date >= g_start,
-                Payment.payment_date < g_end,
-            ).scalar() or 0
+            # ⭐ درآمد (پرداخت‌های این ساختمون)
+            income = 0
+            if unit_ids:
+                income = db.query(
+                    func.coalesce(func.sum(Payment.amount), 0)
+                ).filter(
+                    Payment.unit_id.in_(unit_ids),
+                    Payment.payment_date >= g_start,
+                    Payment.payment_date < g_end,
+                ).scalar() or 0
 
-            # جمع هزینه‌ها
+            # ⭐ هزینه‌های این ساختمون
             expense = db.query(
-                func.coalesce(
-                    func.sum(Expense.amount), 0
-                )
+                func.coalesce(func.sum(Expense.amount), 0)
             ).filter(
+                Expense.building_id == building.id,
                 Expense.expense_date >= g_start,
                 Expense.expense_date < g_end,
             ).scalar() or 0
@@ -3874,17 +3911,17 @@ def get_financial_trend(months=6):
     return trend
 
 def get_expenses_by_category():
-    """
-    مجموع هزینه‌ها بر اساس دسته‌بندی
-    """
-    from models import Expense
+    """مجموع هزینه‌ها بر اساس دسته‌بندی"""
     from sqlalchemy import func
 
     with SessionLocal() as db:
+        building = _get_or_create_building(db)
         results = db.query(
             Expense.category,
             func.sum(Expense.amount).label("total"),
             func.count(Expense.id).label("count"),
+        ).filter(
+            Expense.building_id == building.id
         ).group_by(
             Expense.category
         ).order_by(
@@ -3905,7 +3942,6 @@ def get_expenses_by_category():
             }
             for r in results
         ]
-
 
 # ═══════════ تبدیل تاریخ و ساعت شمسی به datetime میلادی ═══════════
 
@@ -3959,7 +3995,9 @@ def add_note(
             reminder_dt = reminder_at
 
     with SessionLocal() as db:
+        building = _get_or_create_building(db)      # ← ⭐ این خط اضافه شد
         note = Note(
+            building_id=building.id,                # ← ⭐ این خط اضافه شد
             title=title,
             content=str(content or "").strip(),
             category=category or "یادآوری",
@@ -3973,7 +4011,6 @@ def add_note(
         db.commit()
         db.refresh(note)
 
-        # بلافاصله نوتیف‌ها رو چک کن
         try:
             check_and_create_note_notifications()
         except Exception:
@@ -3994,7 +4031,11 @@ def update_note(
     from models import Note
 
     with SessionLocal() as db:
-        note = db.query(Note).filter(Note.id == int(note_id)).first()
+        building = _get_or_create_building(db)          # ← ⭐ جدید
+        note = db.query(Note).filter(
+            Note.id == int(note_id),
+            Note.building_id == building.id,             # ← ⭐ جدید
+        ).first()
         if not note:
             raise ValueError("یادداشت پیدا نشد.")
 
@@ -4039,8 +4080,10 @@ def delete_note(note_id):
     from models import Note
 
     with SessionLocal() as db:
+        building = _get_or_create_building(db)          # ← ⭐ جدید
         note = db.query(Note).filter(
-            Note.id == int(note_id)
+            Note.id == int(note_id),
+            Note.building_id == building.id,             # ← ⭐ جدید
         ).first()
 
         if note:
@@ -4055,8 +4098,10 @@ def toggle_note_done(note_id):
     from models import Note
 
     with SessionLocal() as db:
+        building = _get_or_create_building(db)          # ← ⭐ جدید
         note = db.query(Note).filter(
-            Note.id == int(note_id)
+            Note.id == int(note_id),
+            Note.building_id == building.id,             # ← ⭐ جدید
         ).first()
 
         if note:
@@ -4066,14 +4111,15 @@ def toggle_note_done(note_id):
             return True
         return False
 
-
 def toggle_note_pin(note_id):
     """تغییر وضعیت پین"""
     from models import Note
 
     with SessionLocal() as db:
+        building = _get_or_create_building(db)          # ← ⭐ جدید
         note = db.query(Note).filter(
-            Note.id == int(note_id)
+            Note.id == int(note_id),
+            Note.building_id == building.id,             # ← ⭐ جدید
         ).first()
 
         if note:
@@ -4084,7 +4130,6 @@ def toggle_note_pin(note_id):
             db.commit()
             return True
         return False
-
 
 def list_notes(
     category=None,
@@ -4098,7 +4143,11 @@ def list_notes(
     from models import Note
 
     with SessionLocal() as db:
-        query = db.query(Note)
+        building = _get_or_create_building(db)
+
+        query = db.query(Note).filter(
+            Note.building_id == building.id,             # ← ⭐ حالا درست شد
+        )
 
         if category:
             query = query.filter(
@@ -4149,14 +4198,15 @@ def list_notes(
             for n in notes
         ]
 
-
 def get_note_by_id(note_id):
     """گرفتن یک یادداشت"""
     from models import Note
 
     with SessionLocal() as db:
+        building = _get_or_create_building(db)          # ← ⭐ جدید
         n = db.query(Note).filter(
-            Note.id == int(note_id)
+            Note.id == int(note_id),
+            Note.building_id == building.id,             # ← ⭐ جدید
         ).first()
 
         if not n:
@@ -4176,18 +4226,25 @@ def get_note_by_id(note_id):
             "updated_at": n.updated_at,
         }
 
-
 def get_notes_stats():
     """آمار یادداشت‌ها"""
     from models import Note
     from datetime import datetime, timedelta
 
     with SessionLocal() as db:
-        total = db.query(Note).count()
-        done = db.query(Note).filter(
-            Note.is_done == 1
+        building = _get_or_create_building(db)
+
+        total = db.query(Note).filter(
+            Note.building_id == building.id,             # ← ⭐ جدید
         ).count()
+
+        done = db.query(Note).filter(
+            Note.building_id == building.id,             # ← ⭐ جدید
+            Note.is_done == 1,
+        ).count()
+
         with_reminder = db.query(Note).filter(
+            Note.building_id == building.id,             # ← ⭐ جدید
             Note.reminder_at.isnot(None),
             Note.is_done == 0,
         ).count()
@@ -4199,6 +4256,7 @@ def get_notes_stats():
         ).replace(hour=0, minute=0, second=0)
 
         today_reminders = db.query(Note).filter(
+            Note.building_id == building.id,             # ← ⭐ جدید
             Note.reminder_at.isnot(None),
             Note.reminder_at <= end_of_tomorrow,
             Note.reminder_at >= now,
@@ -4212,8 +4270,6 @@ def get_notes_stats():
             "with_reminder": with_reminder,
             "today_reminders": today_reminders,
         }
-
-
 def get_today_notes(limit=5):
     """
     یادداشت‌های امروز/فردا برای نمایش در داشبورد
@@ -4227,8 +4283,11 @@ def get_today_notes(limit=5):
     ).replace(hour=0, minute=0, second=0)
 
     with SessionLocal() as db:
+        building = _get_or_create_building(db)          # ← ⭐ جدید
+
         # اول: یادداشت‌های با یادآوری امروز/فردا
         notes = db.query(Note).filter(
+            Note.building_id == building.id,             # ← ⭐ جدید
             Note.reminder_at.isnot(None),
             Note.reminder_at <= end_of_tomorrow,
             Note.is_done == 0,
@@ -4241,6 +4300,7 @@ def get_today_notes(limit=5):
             remaining = limit - len(notes)
             note_ids = [n.id for n in notes]
             pinned = db.query(Note).filter(
+                Note.building_id == building.id,         # ← ⭐ جدید
                 Note.is_pinned == 1,
                 Note.is_done == 0,
                 ~Note.id.in_(note_ids)
@@ -4265,7 +4325,6 @@ def get_today_notes(limit=5):
             for n in notes
         ]
 
-
 def check_and_create_note_notifications():
     """
     چک دقیق و انعطاف‌پذیر زمان یادآوری‌ها
@@ -4278,8 +4337,11 @@ def check_and_create_note_notifications():
     created_items = []
 
     with SessionLocal() as db:
+        building = _get_or_create_building(db)          # ← ⭐ جدید
+
         # تمام یادداشت‌های انجام‌نشده دارای زمان یادآوری
         notes = db.query(Note).filter(
+            Note.building_id == building.id,             # ← ⭐ جدید
             Note.reminder_at.isnot(None),
             Note.is_done == 0,
         ).all()
@@ -4340,7 +4402,6 @@ def check_and_create_note_notifications():
         "count": created,
         "items": created_items,
     }
-
 
 # ═══════════ مدیریت Startup ═══════════
 

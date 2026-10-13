@@ -5,13 +5,14 @@
 
 
 """
-Parser فیش‌های بانکی ایرانی — Universal v31
-Fix: Scattered amount collector + Sepino 2555→14050 rule
+Parser فیش‌های بانکی ایرانی — Universal v31.1
+Fix: 5→0 variants for year-prefixed tracking codes
 """
 
 import os
 import sys
 import re
+from itertools import combinations
 from collections import Counter, defaultdict
 from PIL import Image, ImageOps
 
@@ -132,7 +133,8 @@ def _group_lines(boxes):
         if abs(b['y'] - cur[-1]['y']) <= y_th:
             cur.append(b)
         else:
-            rows.append(cur); cur = [b]
+            rows.append(cur);
+            cur = [b]
     rows.append(cur)
     return rows
 
@@ -324,6 +326,64 @@ def _strip_spaces_in_numbers(text):
 
 
 # ═══════════════════════════════════════════════════════════
+# ⭐ NEW: 5→0 variant generator for year-prefixed codes
+# ═══════════════════════════════════════════════════════════
+
+YEAR_PREFIXES = ['1405', '1404', '1403', '1402', '1401', '1400',
+                 '1399', '1398', '1397', '1396', '1395']
+
+
+def _5_to_0_variants(code, max_swaps=3):
+    """
+    برای کدهایی که با سال شمسی شروع می‌شن (140x)،
+    نسخه‌هایی تولید کن که بعضی ۵های tail رو با ۰ عوض می‌کنه.
+
+    منطق: در فیش‌های بانکی، ۰ و ۵ در بعضی فونت‌ها شبیه‌ن
+    و OCR اشتباه می‌کنه.
+    """
+    if not code or len(code) < 8:
+        return [code]
+
+    # چک کردن year prefix
+    year_prefix = None
+    for p in YEAR_PREFIXES:
+        if code.startswith(p):
+            year_prefix = p
+            break
+
+    if year_prefix is None:
+        return [code]
+
+    tail = code[len(year_prefix):]
+
+    # فقط ۵هایی که کنارشون ۵ نیست (isolated 5s)
+    isolated_positions = []
+    for i, c in enumerate(tail):
+        if c != '5':
+            continue
+        prev_is_5 = (i > 0 and tail[i - 1] == '5')
+        next_is_5 = (i < len(tail) - 1 and tail[i + 1] == '5')
+        if not prev_is_5 and not next_is_5:
+            isolated_positions.append(i)
+
+    if not isolated_positions:
+        return [code]
+
+    variants = [code]
+    n_isolated = len(isolated_positions)
+    max_n = min(max_swaps, n_isolated)
+
+    for n in range(1, max_n + 1):
+        for combo in combinations(isolated_positions, n):
+            new_tail = list(tail)
+            for pos in combo:
+                new_tail[pos] = '0'
+            variants.append(year_prefix + ''.join(new_tail))
+
+    return variants
+
+
+# ═══════════════════════════════════════════════════════════
 # ═══  ⭐ Repair: پیگیری (v31)  ═══
 # ═══════════════════════════════════════════════════════════
 
@@ -339,9 +399,7 @@ def _repair_tracking(code):
     if len(code) == 12 and code.startswith('4555'):
         return '14050' + code[4:]
 
-    # ⭐ Sepino: 12-digit `2555...` → `14050...` (فیش ۱۶)
-    if len(code) == 12 and code.startswith('2555'):
-        return '14050' + code[4:]
+
 
     # Refah: 6-digit `39XXXX5` → `39XXXX0`
     if len(code) == 6 and code.startswith('39') and code.endswith('5'):
@@ -424,6 +482,7 @@ def _repair_amount(amount):
                 candidates.append((s4, v))
         except Exception:
             pass
+
     def _score(s_val, v):
         if v < 100_000 or v > _max_reasonable_amount():
             return -1e9
@@ -447,40 +506,30 @@ def _repair_amount(amount):
         if s_val.startswith('11') and len(s_val) > 8:
             score -= 80
         return score
+
     best = max(candidates, key=lambda c: _score(c[0], c[1]))
     return best[1]
 
 
 # ═══════════════════════════════════════════════════════════
-# ═══  ⭐ Scattered Amount Collector (v31)  ═══
+# ═══  Scattered Amount Collector  ═══
 # ═══════════════════════════════════════════════════════════
 
 def _collect_scattered_amounts(text):
-    """
-    اگه یه خط `ریال` داشت ولی هیچ عدد معتبری نبود،
-    همه قطعات عددی رو جمع کن و ترکیب‌های ممکن رو بساز.
-    """
     amounts = []
     for line in text.split('\n'):
         if 'ریال' not in line and 'ريال' not in line:
             continue
-
-        # استخراج همه قطعات عددی
         tokens = re.findall(r'\d[\d,]*', line)
         if not tokens:
             continue
-
-        # حذف کاراکترهای غیرعددی از هر توکن
         cleaned_tokens = []
         for t in tokens:
             t2 = re.sub(r'[^\d]', '', t)
             if t2:
                 cleaned_tokens.append(t2)
-
         if not cleaned_tokens:
             continue
-
-        # ترکیب همه به یه عدد بزرگ
         joined = ''.join(cleaned_tokens)
         if joined:
             try:
@@ -489,8 +538,6 @@ def _collect_scattered_amounts(text):
                     amounts.append(v)
             except Exception:
                 pass
-
-        # ترکیب معکوس (چون RTL)
         joined_rev = ''.join(reversed(cleaned_tokens))
         if joined_rev and joined_rev != joined:
             try:
@@ -499,8 +546,6 @@ def _collect_scattered_amounts(text):
                     amounts.append(v)
             except Exception:
                 pass
-
-        # هر توکن به‌تنهایی
         for t in cleaned_tokens:
             try:
                 v = int(t)
@@ -508,8 +553,6 @@ def _collect_scattered_amounts(text):
                     amounts.append(v)
             except Exception:
                 pass
-
-        # جفت‌های ممکن
         if len(cleaned_tokens) >= 2:
             for i in range(len(cleaned_tokens) - 1):
                 for j in range(i + 1, len(cleaned_tokens)):
@@ -523,7 +566,6 @@ def _collect_scattered_amounts(text):
                                 amounts.append(v)
                         except Exception:
                             pass
-
     return amounts
 
 
@@ -543,7 +585,7 @@ def _smart_amount_from_sources(all_amounts):
     filtered = [
         a for a in unique_amounts
         if 100_000 <= a <= _max_reasonable_amount()
-        and not (1385 <= a <= 1425)
+           and not (1385 <= a <= 1425)
     ]
     if not filtered:
         return 0
@@ -564,6 +606,7 @@ def _smart_amount_from_sources(all_amounts):
     counts = Counter(repaired)
     max_count = max(counts.values())
     top = [v for v, c in counts.items() if c == max_count]
+
     def _score(v):
         s = str(v)
         trailing = len(s) - len(s.rstrip('0'))
@@ -578,6 +621,7 @@ def _smart_amount_from_sources(all_amounts):
         elif len(s) >= 11:
             score -= 200
         return score
+
     return max(top, key=_score)
 
 
@@ -652,7 +696,7 @@ def _repair_date_month(mo):
 
 
 def _crop_region_tesseract(region, thresholds=(100, 128, 160, 190),
-                          psms=(7, 8, 6)):
+                           psms=(7, 8, 6)):
     if not _setup_tesseract():
         return []
     try:
@@ -749,7 +793,7 @@ def _extract_amounts_from_text(text):
                     pass
     fixed_text = _strip_spaces_in_numbers(text)
     for m in re.finditer(
-        r'([0-9][0-9,\.]{3,})\s*(?:ریال|ريال)', fixed_text
+            r'([0-9][0-9,\.]{3,})\s*(?:ریال|ريال)', fixed_text
     ):
         v = int(re.sub(r'[^\d]', '', m.group(1)) or 0)
         if (100_000 <= v <= _max_reasonable_amount()
@@ -839,9 +883,25 @@ def _cross_check_55_with_tesseract(easy_codes, tess_codes):
     return corrections
 
 
+# ═══════════════════════════════════════════════════════════
+# ⭐ UPDATED: _pick_best_tracking with 5→0 variants
+# ═══════════════════════════════════════════════════════════
+
 def _pick_best_tracking(easy_full, easy_crop, tess_full, tess_crop):
-    easy_full_pre = [(_repair_tracking(c), p) for c, p in easy_full]
-    easy_crop_pre = [(_repair_tracking(c), p) for c, p in easy_crop]
+    # ⭐ اول variants رو از کد خام بساز، بعد repair
+    easy_full_pre = []
+    for c, p in easy_full:
+        easy_full_pre.append((c, p))  # خام
+        for v in _5_to_0_variants(c):
+            if v != c:
+                easy_full_pre.append((v, p - 5))
+
+    easy_crop_pre = []
+    for c, p in easy_crop:
+        easy_crop_pre.append((c, p))
+        for v in _5_to_0_variants(c):
+            if v != c:
+                easy_crop_pre.append((v, p - 5))
 
     all_tess_codes = [c for c, _ in tess_full] + [c for c, _ in tess_crop]
 
@@ -869,6 +929,14 @@ def _pick_best_tracking(easy_full, easy_crop, tess_full, tess_crop):
     for code, prio in tess_crop:
         all_items.append((code, prio, 0))
 
+    # ⭐ NEW: اضافه کردن variant‌های 5→0
+    base_items = list(all_items)
+    for code, prio, boost in base_items:
+        for variant in _5_to_0_variants(code):
+            if variant != code:
+                # boost کمتر چون مشتق شده
+                all_items.append((variant, prio, boost - 20))
+
     if not all_items:
         return "", ""
 
@@ -879,15 +947,25 @@ def _pick_best_tracking(easy_full, easy_crop, tess_full, tess_crop):
         if _is_card_like(code):
             return -1e8
         s = prio * 5 + boost
-        if 5 <= len(code) <= 12:
+
+        # طول مناسب
+        if 10 <= len(code) <= 13:
+            s += 40
+        elif 5 <= len(code) <= 12:
             s += 30
-        elif len(code) > 12:
-            s += 5
+        elif len(code) > 13:
+            s -= 30  # ⭐ طول‌های >13 مشکوک
         else:
             s += 10
+
+        # ⭐ NEW: کدهای 140x با طول > 12 = مشکوک
+        if code.startswith('1405') and len(code) >= 13:
+            s -= 200  # penalty سنگین
+        elif code.startswith('140') and len(code) >= 13:
+            s -= 100
+
         s += min(len(code), 12) * 2
         return s
-
     best = max(all_items, key=_score)
     best_code = best[0]
 
@@ -897,8 +975,10 @@ def _pick_best_tracking(easy_full, easy_crop, tess_full, tess_crop):
         source = "tess_full"
     elif any(c == best_code for c, _ in easy_crop_fixed):
         source = "easy_crop"
-    else:
+    elif any(c == best_code for c, _ in tess_crop):
         source = "tess_crop"
+    else:
+        source = "5to0_variant"
 
     return best_code, source
 
@@ -913,7 +993,7 @@ def _extract_dates_from_text(text):
             if 1 <= mo <= 12 and 1 <= d <= 31:
                 dates.append(f"{y}/{mo:02d}/{d:02d}")
     for m in re.finditer(
-        r'\b(\d{1,2})\s*[/]\s*(\d{4})\s*[/]\s*(\d{1,2})\b', text
+            r'\b(\d{1,2})\s*[/]\s*(\d{4})\s*[/]\s*(\d{1,2})\b', text
     ):
         d, y, mo = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if 1300 <= y <= 1500:
@@ -1116,6 +1196,7 @@ def parse_receipt(image_path, debug=False):
     if all_dates:
         def _date_rank(d):
             return (_date_score(d), 1 if d in easy_dates_rep else 0)
+
         best_date = max(all_dates, key=_date_rank)
         result["date"] = best_date
         if (best_date in tess_dates_rep
@@ -1145,7 +1226,7 @@ if __name__ == "__main__":
     import glob
 
     print("=" * 60)
-    print("🧪 receipt_parser (Universal v31)")
+    print("🧪 receipt_parser (Universal v31.1)")
     print("=" * 60)
 
     RECEIPTS_DIR = os.path.join(
@@ -1170,7 +1251,7 @@ if __name__ == "__main__":
         print("═" * 60)
 
         try:
-            result = parse_receipt(IMAGE_PATH, debug=False)
+            result = parse_receipt(IMAGE_PATH, debug=(idx == 15))
         except Exception as ex:
             print(f"❌ خطای کلی: {ex}")
             continue

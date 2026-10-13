@@ -20,6 +20,12 @@ EasyOCR_models.zip
 Tesseract-OCR.zip
 Tesseract-OCR-Lite.zip
 Tesseract-Lite/
+
+simplerec/
+
+
+build.bat
+setup.iss
 # اطلاعات کاربر
 uploads/
 reports/

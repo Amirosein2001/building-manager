@@ -26,6 +26,9 @@ class Building(Base):
                           cascade="all, delete-orphan")
     bills = relationship("UtilityBill", back_populates="building",
                           cascade="all, delete-orphan")
+    # ⭐ NEW: relationship برای هزینه‌ها
+    expenses = relationship("Expense", back_populates="building",
+                             cascade="all, delete-orphan")
 
 
 class Unit(Base):
@@ -96,6 +99,10 @@ class Expense(Base):
     __tablename__ = "expenses"
 
     id = Column(Integer, primary_key=True)
+    # ⭐ NEW: اتصال به ساختمان
+    building_id = Column(Integer,
+                          ForeignKey("buildings.id"),
+                          nullable=True)  # ← nullable تا مهاجرت راحت باشه
     title = Column(String(100), nullable=False)
     category = Column(String(50), default="سایر")
     amount = Column(Float, nullable=False)
@@ -103,6 +110,9 @@ class Expense(Base):
     description = Column(Text, default="")
     invoice_image = Column(String(500), default="")
     created_at = Column(DateTime, default=datetime.now)
+
+    # ⭐ NEW: relationship
+    building = relationship("Building", back_populates="expenses")
 
 
 class UtilityBill(Base):
@@ -206,6 +216,9 @@ class Note(Base):
     __tablename__ = "notes"
 
     id = Column(Integer, primary_key=True)
+    building_id = Column(Integer,
+                          ForeignKey("buildings.id"),
+                          nullable=True)          # ← ⭐ جدید
     title = Column(String(200), nullable=False)
     content = Column(Text, default="")
 

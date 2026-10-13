@@ -143,6 +143,8 @@ from services import (
     # ─── تنظیمات ───
     get_setting,
     set_setting,
+    _bs,
+    _bsset,
 
     # ─── تاریخ و کمکی ───
     to_jalali,
@@ -1046,15 +1048,11 @@ def get_logo_or_default():
     try:
         from services import (
             get_building_info,
-            get_setting,
+            _bs,
         )
         info = get_building_info()
-        bg_color = get_setting(
-            "logo_bg_color", "#1565C0"
-        )
-        text_color = get_setting(
-            "logo_text_color", "white"
-        )
+        bg_color = _bs("logo_bg_color", "#1565C0")
+        text_color = _bs("logo_text_color", "white")
         logo_path = generate_circular_logo(
             text=info["name"],
             bg_color=bg_color,
@@ -2367,6 +2365,177 @@ async def main(page: ft.Page):
             print("✅ ستون related_expense_id اضافه شد")
     except Exception:
         pass  # اگه ستون قبلاً وجود داره، طبیعیه
+
+    # ⭐ اضافه کردن ستون building_id به expenses (multi-building)
+    try:
+        from sqlalchemy import text
+        from database import engine
+        with engine.connect() as conn:
+            conn.execute(text(
+                "ALTER TABLE expenses "
+                "ADD COLUMN building_id INTEGER"
+            ))
+            conn.commit()
+            print("✅ ستون building_id به expenses اضافه شد")
+    except Exception:
+        pass
+
+    # ⭐ اضافه کردن ستون building_id به notes (multi-building)
+    # ⚠️ نکته: قبلاً این بلاک داخل except بالایی بود و هیچ‌وقت
+    # اجرا نمی‌شد. الان بیرون اومده و همیشه اجرا می‌شه.
+    try:
+        from sqlalchemy import text
+        from database import engine
+        with engine.connect() as conn:
+            conn.execute(text(
+                "ALTER TABLE notes "
+                "ADD COLUMN building_id INTEGER"
+            ))
+            conn.commit()
+            print("✅ ستون building_id به notes اضافه شد")
+    except Exception:
+        pass
+
+    # ⭐⭐ انتقال یادداشت‌های قدیمی (building_id=NULL) به ساختمون اول
+    try:
+        from database import SessionLocal as _SL_N
+        from models import Note as _N, Building as _B
+        with _SL_N() as _db:
+            first_b = _db.query(_B).order_by(_B.id.asc()).first()
+            if first_b:
+                updated = _db.query(_N).filter(
+                    _N.building_id.is_(None)
+                ).update({"building_id": first_b.id})
+                _db.commit()
+                if updated:
+                    print(
+                        f"✅ {updated} یادداشت قدیمی به ساختمون "
+                        f"اول (#{first_b.id}) منتقل شد"
+                    )
+    except Exception as ex:
+        print(f"⚠️ migration notes error: {ex}")
+
+    # ⭐⭐ انتقال تنظیمات SMSGate سراسری به ساختمون اول
+    try:
+        from database import SessionLocal as _SL_S
+        from models import Building as _B_S, AppSetting as _A_S
+        with _SL_S() as db:
+            first_b = db.query(_B_S).order_by(_B_S.id.asc()).first()
+            if first_b:
+                sms_keys = [
+                    "smsgate_username",
+                    "smsgate_password",
+                    "sms_test_phone",
+                ]
+                moved = 0
+                for key in sms_keys:
+                    per_key = f"{key}_b{first_b.id}"
+                    # اگه قبلاً per-building ساخته شده، رد کن
+                    exists = db.query(_A_S).filter(
+                        _A_S.key == per_key
+                    ).first()
+                    if exists:
+                        continue
+                    # مقدار global رو بگیر و کپی کن
+                    global_setting = db.query(_A_S).filter(
+                        _A_S.key == key
+                    ).first()
+                    if global_setting and global_setting.value:
+                        db.add(_A_S(
+                            key=per_key,
+                            value=global_setting.value,
+                        ))
+                        moved += 1
+                db.commit()
+                if moved:
+                    print(
+                        f"✅ {moved} تنظیم SMSGate به ساختمون "
+                        f"اول (#{first_b.id}) منتقل شد"
+                    )
+    except Exception as ex:
+        print(f"⚠️ migration sms error: {ex}")
+
+        # اگه قبلاً بود، طبیعیه
+    # ⭐⭐ مهاجرت: کپی تنظیمات global به per-building برای ساختمون اول
+    try:
+        from database import SessionLocal as _SL2
+        from models import Building as _B2, AppSetting as _A2
+
+        # لیست کلیدهایی که باید per-building بشن
+        per_building_keys = [
+            "initial_balance",
+            "bank_card",
+            "bank_account",
+            "bank_sheba",
+            "bank_owner",
+            "logo_bg_color",
+            "logo_text_color",
+            "water_bill_id",
+            "electricity_bill_id",
+            "gas_bill_id",
+            "auto_charge_enabled",
+            "auto_charge_method",
+            "auto_charge_value",
+            "auto_charge_issue_day",
+            "auto_charge_due_day",
+            "sms_on_issue",
+            "sms_reminder",
+            "sms_overdue",
+            "sms_thanks_on_payment",
+            "late_fee_enabled",
+            "late_fee_amount",
+        ]
+
+        with _SL2() as _db:
+            first_b = _db.query(_B2).order_by(_B2.id.asc()).first()
+            if first_b:
+                migrated_count = 0
+                for key in per_building_keys:
+                    per_key = f"{key}_b{first_b.id}"
+
+                    # اگه per-building قبلاً ساخته شده، رد کن
+                    exists = _db.query(_A2).filter(
+                        _A2.key == per_key
+                    ).first()
+                    if exists:
+                        continue
+
+                    # مقدار global رو پیدا کن
+                    global_setting = _db.query(_A2).filter(
+                        _A2.key == key
+                    ).first()
+
+                    if global_setting and global_setting.value:
+                        _db.add(_A2(
+                            key=per_key,
+                            value=global_setting.value,
+                        ))
+                        migrated_count += 1
+
+                _db.commit()
+
+                if migrated_count > 0:
+                    print(
+                        f"✅ {migrated_count} تنظیم به ساختمون اول "
+                        f"(#{first_b.id}) منتقل شد"
+                    )
+    except Exception as ex:
+        print(f"⚠️ migration per-building error: {ex}")
+    # ⭐ مقداردهی اولیه: همه‌ی هزینه‌های موجود به ساختمون اول
+    try:
+        from database import SessionLocal as _SL
+        from models import Building as _B, Expense as _E
+        with _SL() as db:
+            first = db.query(_B).first()
+            if first:
+                updated = db.query(_E).filter(
+                    _E.building_id.is_(None)
+                ).update({"building_id": first.id})
+                db.commit()
+                if updated:
+                    print(f"✅ {updated} هزینه به ساختمون اول متصل شد")
+    except Exception as ex:
+        print(f"⚠️ migration error: {ex}")
 
     # ═══════════ چک صدور خودکار شارژ ═══════════
     auto_result = check_and_auto_generate_charge()
@@ -4981,7 +5150,8 @@ async def main(page: ft.Page):
         ],
             scroll=ft.ScrollMode.AUTO,
             expand=True,
-            spacing=0)
+            spacing=0,
+            key="dashboard_page")  # ← این خط اضافه شد
 
     def build_units_page():
         # ═══════ گرفتن رنگ‌های تم ═══════
@@ -6186,7 +6356,8 @@ async def main(page: ft.Page):
 
             list_col,
 
-        ], scroll=ft.ScrollMode.AUTO, expand=True)
+        ], scroll=ft.ScrollMode.AUTO, expand=True,
+            key="units_page")  # ← این خط اضافه شد
 
     # ═══════════ شارژ و پرداخت ═════════
     def build_charges_page():
@@ -6982,6 +7153,264 @@ async def main(page: ft.Page):
         )
 
         # ⭐ OCR خودکار (بعد از آپلود)
+        # ⭐ دیالوگ تایید اطلاعات OCR
+        def show_ocr_confirm_dialog(image_path, ocr_result):
+            """
+            دیالوگ تایید اطلاعات استخراج‌شده از فیش
+            - سمت چپ: تصویر فیش (بزرگ، قابل کلیک برای بزرگنمایی)
+            - سمت راست: فیلدهای قابل ویرایش
+            - دکمه تایید: مقادیر رو به فرم پرداخت منتقل می‌کنه
+            """
+            # ─── مقدار اولیه مبلغ (به تومان) ───
+            amount_toman = 0
+            if ocr_result.get("amount_rial"):
+                try:
+                    amount_toman = int(ocr_result["amount_rial"]) // 10
+                except Exception:
+                    amount_toman = 0
+
+            confirm_amount = make_amount_field(
+                label="مبلغ",
+                width=300,
+                initial_value=amount_toman,
+            )
+
+            confirm_tracking = ft.TextField(
+                label="شماره پیگیری",
+                width=300,
+                value=str(ocr_result.get("tracking_code") or ""),
+                text_align=ft.TextAlign.RIGHT,
+            )
+
+            confirm_date = ft.TextField(
+                label="تاریخ (شمسی)",
+                width=300,
+                value=str(ocr_result.get("date") or ""),
+                hint_text="1405/05/16",
+                text_align=ft.TextAlign.RIGHT,
+            )
+
+            # ─── تصویر فیش ───
+            img_src = image_to_base64_src(image_path)
+            if img_src:
+                img_widget = ft.Image(
+                    src=img_src,
+                    fit=ft.BoxFit.CONTAIN,
+                )
+            else:
+                img_widget = ft.Column([
+                    ft.Icon(
+                        ft.Icons.IMAGE_NOT_SUPPORTED,
+                        size=60, color=TEXT_MUTED,
+                    ),
+                    ft.Text(
+                        "تصویر نمایش داده نشد",
+                        size=12, color=TEXT_MUTED,
+                    ),
+                ], spacing=8,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
+            img_container = ft.Container(
+                width=420,
+                height=580,
+                bgcolor=theme["bg_hover"],
+                border_radius=12,
+                padding=8,
+                alignment=ft.Alignment.CENTER,
+                content=img_widget,
+                on_click=lambda e: show_full_image(page, image_path),
+                ink=True,
+                tooltip="برای بزرگنمایی کلیک کنید",
+            )
+
+            # ─── ستون فیلدها ───
+            fields_col = ft.Column(
+                controls=[
+                    ft.Text(
+                        "📄 اطلاعات استخراج‌شده",
+                        size=16,
+                        weight=ft.FontWeight.BOLD,
+                        color=P,
+                    ),
+                    ft.Container(height=4),
+                    ft.Text(
+                        "مقادیر را بررسی و در صورت نیاز اصلاح کنید",
+                        size=11,
+                        color=TEXT_MUTED,
+                    ),
+                    ft.Divider(height=1, color=DIVIDER),
+                    ft.Container(height=8),
+
+                    ft.Row([
+                        ft.Icon(
+                            ft.Icons.ATTACH_MONEY,
+                            size=18, color=S,
+                        ),
+                        ft.Text(
+                            "مبلغ:",
+                            size=12,
+                            weight=ft.FontWeight.BOLD,
+                            color=TEXT_MAIN,
+                        ),
+                    ], spacing=6),
+                    confirm_amount,
+                    ft.Container(height=8),
+
+                    ft.Row([
+                        ft.Icon(
+                            ft.Icons.CONFIRMATION_NUMBER,
+                            size=18, color=P,
+                        ),
+                        ft.Text(
+                            "شماره پیگیری:",
+                            size=12,
+                            weight=ft.FontWeight.BOLD,
+                            color=TEXT_MAIN,
+                        ),
+                    ], spacing=6),
+                    confirm_tracking,
+                    ft.Container(height=8),
+
+                    ft.Row([
+                        ft.Icon(
+                            ft.Icons.CALENDAR_TODAY,
+                            size=18, color=W,
+                        ),
+                        ft.Text(
+                            "تاریخ:",
+                            size=12,
+                            weight=ft.FontWeight.BOLD,
+                            color=TEXT_MAIN,
+                        ),
+                    ], spacing=6),
+                    confirm_date,
+                    ft.Container(height=15),
+
+                    # ─── منابع استخراج ───
+                    ft.Container(
+                        bgcolor=theme["primary_bg"],
+                        border_radius=8,
+                        padding=10,
+                        content=ft.Column([
+                            ft.Text(
+                                "ℹ️ منابع استخراج:",
+                                size=10,
+                                weight=ft.FontWeight.BOLD,
+                                color=P,
+                            ),
+                            ft.Text(
+                                f"💰 مبلغ: "
+                                f"{ocr_result.get('source_amount', '-')}",
+                                size=9, color=TEXT_SECONDARY,
+                            ),
+                            ft.Text(
+                                f"📌 پیگیری: "
+                                f"{ocr_result.get('source_tracking', '-')}",
+                                size=9, color=TEXT_SECONDARY,
+                            ),
+                            ft.Text(
+                                f"📅 تاریخ: "
+                                f"{ocr_result.get('source_date', '-')}",
+                                size=9, color=TEXT_SECONDARY,
+                            ),
+                        ], spacing=2),
+                    ),
+                ],
+                spacing=4,
+                expand=True,
+                scroll=ft.ScrollMode.AUTO,
+            )
+
+            # ─── چیدمان افقی ───
+            content_row = ft.Row(
+                controls=[
+                    img_container,
+                    ft.Container(width=15),
+                    ft.Container(
+                        content=fields_col,
+                        expand=True,
+                    ),
+                ],
+                spacing=0,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            )
+
+            # ─── تایید: انتقال به فرم ───
+            def do_confirm(e):
+                try:
+                    if confirm_amount.value:
+                        pay_amount.value = format_amount_input(
+                            unformat_amount(confirm_amount.value)
+                        )
+                    if confirm_tracking.value:
+                        pay_tracking.value = confirm_tracking.value.strip()
+                    if confirm_date.value:
+                        pay_date.text_field.value = (
+                            confirm_date.value.strip()
+                        )
+
+                    ocr_status_text.value = (
+                        "✅ اطلاعات تایید و به فرم منتقل شد"
+                    )
+                    ocr_status_text.color = S
+
+                    dlg.open = False
+                    page.update()
+                except Exception as ex:
+                    print(f"❌ خطای تایید: {ex}")
+                    import traceback
+                    traceback.print_exc()
+
+            # ─── انصراف ───
+            def do_cancel(e):
+                ocr_status_text.value = (
+                    "⚠️ تایید لغو شد — مقادیر را دستی وارد کنید"
+                )
+                ocr_status_text.color = W
+                dlg.open = False
+                page.update()
+
+            # ─── دیالوگ ───
+            dlg = ft.AlertDialog(
+                modal=True,
+                title=ft.Row([
+                    ft.Icon(
+                        ft.Icons.CHECK_CIRCLE,
+                        color=P, size=24,
+                    ),
+                    ft.Text(
+                        "تایید اطلاعات فیش",
+                        size=18,
+                        weight=ft.FontWeight.BOLD,
+                        color=TEXT_MAIN,
+                    ),
+                ], spacing=8),
+                content=ft.Container(
+                    width=900,
+                    height=650,
+                    content=content_row,
+                ),
+                actions=[
+                    ft.Button(
+                        "✅ تایید و انتقال به فرم",
+                        bgcolor=S, color="white",
+                        height=42,
+                        on_click=do_confirm,
+                    ),
+                    ft.TextButton(
+                        "❌ انصراف",
+                        on_click=do_cancel,
+                    ),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+
+            if dlg not in page.overlay:
+                page.overlay.append(dlg)
+            dlg.open = True
+            page.update()
+
+        # ⭐ OCR خودکار (بعد از آپلود)
         def _run_ocr_auto(uploaded_path):
             if not uploaded_path or not os.path.exists(uploaded_path):
                 return
@@ -7026,48 +7455,17 @@ async def main(page: ft.Page):
                             pass
                         return
 
-                    filled = []
-
-                    if result.get("amount_rial"):
-                        try:
-                            toman = int(result["amount_rial"]) // 10
-                            pay_amount.value = format_amount_input(str(toman))
-                            filled.append("مبلغ")
-                        except Exception as ex:
-                            print(f"⚠️ خطای مبلغ: {ex}")
-
-                    if result.get("tracking_code"):
-                        try:
-                            pay_tracking.value = str(result["tracking_code"])
-                            filled.append("پیگیری")
-                        except Exception as ex:
-                            print(f"⚠️ خطای پیگیری: {ex}")
-
-                    if result.get("date"):
-                        try:
-                            pay_date.text_field.value = str(result["date"])
-                            filled.append("تاریخ")
-                        except Exception as ex:
-                            print(f"⚠️ خطای تاریخ: {ex}")
-
+                    ocr_status_text.value = (
+                        "✅ استخراج شد — لطفاً تایید کنید"
+                    )
+                    ocr_status_text.color = S
                     try:
                         page.update()
                     except Exception:
                         pass
 
-                    if filled:
-                        ocr_status_text.value = (
-                            f"✅ {', '.join(filled)} استخراج شد"
-                        )
-                        ocr_status_text.color = S
-                    else:
-                        ocr_status_text.value = "⚠️ فیلدی استخراج نشد"
-                        ocr_status_text.color = W
-
-                    try:
-                        page.update()
-                    except Exception:
-                        pass
+                    # ⭐ نمایش دیالوگ تایید
+                    show_ocr_confirm_dialog(uploaded_path, result)
 
                 try:
                     page.run_task(_apply)
@@ -7660,7 +8058,8 @@ async def main(page: ft.Page):
                 sidebar, ft.Container(width=15), main_panel,
             ], expand=True, spacing=0,
                 vertical_alignment=ft.CrossAxisAlignment.START),
-        ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0)
+        ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0,
+            key="charges_page")  # ← این خط اضافه شد
 
     # ═══════════ هزینه‌ها ═══════════
     def build_expenses_page():
@@ -8801,7 +9200,8 @@ async def main(page: ft.Page):
                 sidebar, ft.Container(width=15), main_panel,
             ], expand=True, spacing=0,
                 vertical_alignment=ft.CrossAxisAlignment.START),
-        ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0)
+        ], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0,
+            key="expenses_page")  # ← این خط اضافه شد
 
     # ═══════════ قبوض ═══════════
     def build_bills_page():
@@ -9121,11 +9521,11 @@ async def main(page: ft.Page):
             icon = icons.get(new_type, "")
 
             if new_type == "آب":
-                saved = get_setting("water_bill_id", "")
+                saved = _bs("water_bill_id", "")  # ← تغییر
             elif new_type == "برق":
-                saved = get_setting("electricity_bill_id", "")
+                saved = _bs("electricity_bill_id", "")  # ← تغییر
             elif new_type == "گاز":
-                saved = get_setting("gas_bill_id", "")
+                saved = _bs("gas_bill_id", "")  # ← تغییر
 
             bill_id.value = saved
             bill_id.label = f"{icon} شناسه قبض {new_type} *"
@@ -10086,7 +10486,8 @@ async def main(page: ft.Page):
                 traceback.print_exc()
 
         # لود اولیه
-        initial_saved = get_setting("water_bill_id", "")
+        # لود اولیه
+        initial_saved = _bs("water_bill_id", "")  # ← فقط get رو _bs کن
         bill_id.value = initial_saved
         bill_id.label = "💧 شناسه قبض آب *"
         load()
@@ -10168,7 +10569,8 @@ async def main(page: ft.Page):
             ft.Container(height=8),
 
             chart_col,
-        ], scroll=ft.ScrollMode.AUTO, expand=True)
+        ], scroll=ft.ScrollMode.AUTO, expand=True,
+            key="bills_page")  # ← این خط اضافه شد
     # ═══════════ گزارش مالی ═══════════
     def build_reports_page():
         # ─── رنگ‌های تم ───
@@ -12132,7 +12534,8 @@ async def main(page: ft.Page):
 
             content_col,
 
-        ], scroll=ft.ScrollMode.AUTO, expand=True)
+        ], scroll=ft.ScrollMode.AUTO, expand=True,
+            key="reports_page")  # ← این خط اضافه شد
 
     def build_sms_page():
         theme = get_theme_colors()
@@ -12558,7 +12961,8 @@ async def main(page: ft.Page):
             ),
             ft.Container(height=15),
             result_col,
-        ], scroll=ft.ScrollMode.AUTO, expand=True)
+        ], scroll=ft.ScrollMode.AUTO, expand=True,
+            key="sms_page")  # ← این خط اضافه شد
 
     # ═══════════ صفحه یادداشت‌ها ═══════════
     def build_notes_page():
@@ -13297,7 +13701,9 @@ async def main(page: ft.Page):
             notes_grid_container,
             ft.Container(height=20),
         ], scroll=ft.ScrollMode.AUTO, expand=True,
-            spacing=0)
+            spacing=0,
+            key="notes_page")  # ← این خط اضافه شد
+
 
     # ═══════════ اعمال آنیِ تغییر واحد پول/تم ═══════════
     def apply_appearance_change():
@@ -13331,6 +13737,365 @@ async def main(page: ft.Page):
         except Exception as ex:
             print(f"⚠️ خطای اعمال آنیِ ظاهر: {ex}")
 
+
+    # ═══════════════════════════════════════
+    # ═══ صفحه‌ی مدیریت ساختمان‌ها ═══
+    # ═══════════════════════════════════════
+    def build_buildings_page():
+        """صفحه‌ی مدیریت ساختمان‌ها (multi-building)"""
+        try:
+            from services import (
+                list_buildings,
+                add_building,
+                update_building_by_id,
+                delete_building,
+                switch_building,
+            )
+        except Exception as ex:
+            print(f"❌ import error: {ex}")
+            return ft.Column([
+                ft.Text(f"خطا در import: {ex}", color="red", size=14),
+            ])
+
+        theme = get_theme_colors()
+        P = theme["primary"]
+        S = theme["success"]
+        W = theme["warning"]
+        D = theme["danger"]
+        BG_CARD = theme["bg_card"]
+        TEXT_MAIN = theme["text_main"]
+        TEXT_SECONDARY = theme["text_secondary"]
+        TEXT_MUTED = theme["text_muted"]
+        DIVIDER = theme["divider"]
+
+        list_col = ft.Column(spacing=10)
+        editing_id = [None]
+
+        # ─── فیلدهای فرم ───
+        name_field = ft.TextField(
+            label="نام ساختمان *", width=250,
+        )
+        addr_field = ft.TextField(
+            label="آدرس", width=350,
+        )
+        floors_field = ft.TextField(
+            label="تعداد طبقات", width=150,
+        )
+        units_field = ft.TextField(
+            label="تعداد واحدها", width=150,
+        )
+
+        save_btn = ft.Button(
+            "💾 ذخیره ساختمان جدید",
+            bgcolor=P, color="white",
+        )
+
+        def clear_form():
+            editing_id[0] = None
+            name_field.value = ""
+            addr_field.value = ""
+            floors_field.value = ""
+            units_field.value = ""
+            save_btn.text = "💾 ذخیره ساختمان جدید"
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def do_switch(bid):
+            try:
+                switch_building(bid)
+                msg("✅ ساختمون فعال تغییر کرد", S)
+                _refresh_building_selector()  # ⭐
+                load()
+                nav(build_dashboard)
+            except Exception as ex:
+                msg(f"خطا: {ex}", D)
+
+        def do_edit(b):
+            editing_id[0] = b["id"]
+            name_field.value = b["name"]
+            addr_field.value = b["address"]
+            floors_field.value = str(b["floors"])
+            units_field.value = str(b["total_units"])
+            save_btn.text = "✏️ بروزرسانی"
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def do_delete(bid, name):
+            def confirm(e):
+                try:
+                    delete_building(bid)
+                    dlg.open = False
+                    page.update()
+                    msg(f"«{name}» حذف شد", W)
+                    load()
+                except Exception as ex:
+                    msg(f"خطا: {ex}", D)
+
+            def cancel(e):
+                dlg.open = False
+                page.update()
+
+            dlg = ft.AlertDialog(
+                modal=True,
+                title=ft.Row([
+                    ft.Icon(ft.Icons.WARNING_AMBER, color=D, size=26),
+                    ft.Text("تأیید حذف", weight=ft.FontWeight.BOLD),
+                ]),
+                content=ft.Container(
+                    width=400,
+                    content=ft.Column([
+                        ft.Text(
+                            f"آیا از حذف «{name}» مطمئن هستید؟",
+                            size=13, color=TEXT_MAIN,
+                        ),
+                        ft.Container(height=8),
+                        ft.Container(
+                            padding=10,
+                            bgcolor=theme["danger_bg"],
+                            border_radius=8,
+                            content=ft.Text(
+                                "⚠️ تمام واحدها، شارژها، پرداخت‌ها، "
+                                "هزینه‌ها و قبوض این ساختمان نیز "
+                                "حذف خواهند شد.",
+                                size=11, color=D,
+                                weight=ft.FontWeight.BOLD,
+                            ),
+                        ),
+                    ], spacing=6),
+                ),
+                actions=[
+                    ft.Button("حذف", bgcolor=D, color="white",
+                              on_click=confirm),
+                    ft.TextButton("انصراف", on_click=cancel),
+                ],
+            )
+            if dlg not in page.overlay:
+                page.overlay.append(dlg)
+            dlg.open = True
+            page.update()
+
+        def on_save(e):
+            try:
+                name = (name_field.value or "").strip()
+                if not name:
+                    msg("نام ساختمان الزامی است", D)
+                    return
+
+                try:
+                    floors = int(floors_field.value or 0)
+                except Exception:
+                    floors = 0
+                try:
+                    units = int(units_field.value or 0)
+                except Exception:
+                    units = 0
+
+                if editing_id[0]:
+                    update_building_by_id(
+                        editing_id[0], name,
+                        addr_field.value or "",
+                        floors, units,
+                    )
+                    msg("✅ بروزرسانی شد", S)
+                else:
+                    add_building(
+                        name,
+                        addr_field.value or "",
+                        floors, units,
+                    )
+                    msg("✅ ساختمان جدید ساخته شد", S)
+
+                _refresh_building_selector()  # ⭐
+                clear_form()
+                load()
+            except Exception as ex:
+                msg(f"خطا: {ex}", D)
+
+        save_btn.on_click = on_save
+
+        def load():
+            list_col.controls.clear()
+            try:
+                buildings = list_buildings()
+            except Exception as ex:
+                print(f"❌ list_buildings error: {ex}")
+                buildings = []
+
+            if not buildings:
+                list_col.controls.append(
+                    ft.Container(
+                        padding=30,
+                        content=ft.Text(
+                            "ساختمونی ثبت نشده",
+                            color=TEXT_MUTED,
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                    )
+                )
+                try:
+                    page.update()
+                except Exception:
+                    pass
+                return
+
+            for b in buildings:
+                is_active = b["is_active"]
+
+                status_badge = ft.Container(
+                    padding=ft.Padding(8, 3, 8, 3),
+                    border_radius=8,
+                    bgcolor=S if is_active else theme["bg_hover"],
+                    content=ft.Text(
+                        "✅ فعال" if is_active else "غیرفعال",
+                        size=10,
+                        color="white" if is_active else TEXT_MUTED,
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                )
+
+                if is_active:
+                    switch_btn = ft.Container(width=0)
+                else:
+                    switch_btn = ft.Button(
+                        "🔄 سوییچ",
+                        bgcolor=S,
+                        color="white",
+                        height=32,
+                        on_click=lambda e, bid=b["id"]: do_switch(bid),
+                    )
+
+                # ⭐ Border به روش درست (سازگار با Flet فعلی)
+                border_color = S if is_active else theme["border"]
+                border_width = 2 if is_active else 1
+                safe_border = ft.Border(
+                    top=ft.BorderSide(border_width, border_color),
+                    bottom=ft.BorderSide(border_width, border_color),
+                    left=ft.BorderSide(border_width, border_color),
+                    right=ft.BorderSide(border_width, border_color),
+                )
+
+                card = ft.Container(
+                    padding=15,
+                    border_radius=12,
+                    bgcolor=theme["success_bg"] if is_active else BG_CARD,
+                    border=safe_border,
+                    content=ft.Row([
+                        ft.Container(
+                            width=50, height=50,
+                            border_radius=12,
+                            bgcolor=S if is_active else P,
+                            content=ft.Icon(
+                                ft.Icons.APARTMENT,
+                                color="white", size=26,
+                            ),
+                            alignment=ft.Alignment.CENTER,
+                        ),
+                        ft.Column([
+                            ft.Row([
+                                ft.Text(
+                                    b["name"],
+                                    size=16,
+                                    weight=ft.FontWeight.BOLD,
+                                    color=S if is_active else TEXT_MAIN,
+                                ),
+                                status_badge,
+                            ], spacing=8),
+                            ft.Text(
+                                f"📍 {b['address'] or 'بدون آدرس'}",
+                                size=11, color=TEXT_SECONDARY,
+                            ),
+                            ft.Text(
+                                f"🏢 {b['floors']} طبقه • "
+                                f"🚪 {b['total_units']} واحد",
+                                size=11, color=TEXT_MUTED,
+                            ),
+                        ], spacing=3, expand=True),
+                        ft.Row([
+                            switch_btn,
+                            ft.IconButton(
+                                icon=ft.Icons.EDIT,
+                                icon_color=P,
+                                tooltip="ویرایش",
+                                on_click=lambda e, bd=b: do_edit(bd),
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.DELETE,
+                                icon_color=D,
+                                tooltip="حذف",
+                                on_click=lambda e, bid=b["id"],
+                                                nm=b["name"]:
+                                    do_delete(bid, nm),
+                            ),
+                        ], spacing=4),
+                    ], spacing=12),
+                )
+                list_col.controls.append(card)
+
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        load()
+
+        return ft.Column([
+            ft.Text(
+                "🏢 مدیریت ساختمان‌ها",
+                size=28,
+                weight=ft.FontWeight.BOLD,
+                color=TEXT_MAIN,
+            ),
+            ft.Text(
+                "چند ساختمان داشته باشید و بین آن‌ها سوییچ کنید",
+                size=12, color=TEXT_MUTED,
+            ),
+            ft.Container(height=15),
+
+            # ─── فرم ───
+            ft.Container(
+                bgcolor=BG_CARD,
+                border_radius=14,
+                padding=20,
+                content=ft.Column([
+                    ft.Row([
+                        ft.Icon(ft.Icons.ADD_HOME, color=P, size=22),
+                        ft.Text(
+                            "افزودن / ویرایش ساختمان",
+                            size=16,
+                            weight=ft.FontWeight.BOLD,
+                            color=TEXT_MAIN,
+                        ),
+                    ], spacing=8),
+                    ft.Divider(height=1, color=DIVIDER),
+                    ft.Row([name_field, addr_field], wrap=True),
+                    ft.Row([floors_field, units_field], wrap=True),
+                    ft.Row([
+                        save_btn,
+                        ft.TextButton(
+                            "انصراف",
+                            on_click=lambda e: clear_form(),
+                        ),
+                    ], spacing=8),
+                ], spacing=10),
+            ),
+
+            ft.Container(height=15),
+            ft.Text(
+                "📋 لیست ساختمان‌ها",
+                size=18,
+                weight=ft.FontWeight.BOLD,
+                color=TEXT_MAIN,
+            ),
+            ft.Container(height=8),
+            list_col,
+        ], scroll=ft.ScrollMode.AUTO, expand=True,
+            key="buildings_page")  # ← این خط اضافه شد
+
+
     # ═══════════ تنظیمات ═══════════
     def build_settings_page():
         theme = get_theme_colors()
@@ -13354,15 +14119,17 @@ async def main(page: ft.Page):
         bu = ft.TextField(label="تعداد واحدها", width=120, value=str(info["total_units"]))
 
         # ─── اطلاعات بانکی ───
-        bc = ft.TextField(label="شماره کارت", width=250, value=get_setting("bank_card", ""))
-        bac = ft.TextField(label="شماره حساب", width=250, value=get_setting("bank_account", ""))
-        bsh = ft.TextField(label="شماره شبا", width=300, value=get_setting("bank_sheba", ""))
-        bon = ft.TextField(label="نام صاحب حساب", width=250, value=get_setting("bank_owner", ""))
+        from services import _bs
+        bc = ft.TextField(label="شماره کارت", width=250, value=_bs("bank_card", ""))
+        bac = ft.TextField(label="شماره حساب", width=250, value=_bs("bank_account", ""))
+        bsh = ft.TextField(label="شماره شبا", width=300, value=_bs("bank_sheba", ""))
+        bon = ft.TextField(label="نام صاحب حساب", width=250, value=_bs("bank_owner", ""))
 
         # ─── موجودی اولیه ───
+        from services import _bs
         init_bal = make_amount_field(
             label="موجودی اولیه صندوق", width=250,
-            initial_value=get_setting("initial_balance", "0"),
+            initial_value=_bs("initial_balance", "0"),
         )
 
         # ─── واحد پول ───
@@ -13405,7 +14172,8 @@ async def main(page: ft.Page):
             "⚫ مشکی": "#212121", "🔷 فیروزه‌ای": "#00838F",
         }
         LOGO_COLORS_REVERSE = {v: k for k, v in LOGO_COLORS.items()}
-        current_logo_bg = get_setting("logo_bg_color", "#1565C0")
+        from services import _bs
+        current_logo_bg = _bs("logo_bg_color", "#1565C0")
         current_logo_bg_text = LOGO_COLORS_REVERSE.get(current_logo_bg, "🔵 آبی")
 
         logo_color_dd = ft.Dropdown(
@@ -13415,7 +14183,7 @@ async def main(page: ft.Page):
 
         logo_text_color_dd = ft.Dropdown(
             label="رنگ متن", width=150,
-            value=("سفید" if get_setting("logo_text_color", "white") == "white" else "مشکی"),
+            value=("سفید" if _bs("logo_text_color", "white") == "white" else "مشکی"),
             options=[ft.dropdown.Option(text="سفید"), ft.dropdown.Option(text="مشکی")],
         )
 
@@ -13463,10 +14231,10 @@ async def main(page: ft.Page):
                 )
 
                 if logo_path:
-                    set_setting("logo_bg_color", bg_color)
-                    set_setting("logo_text_color", text_color)
+                    from services import _bsset
+                    _bsset("logo_bg_color", bg_color)
+                    _bsset("logo_text_color", text_color)
                     load_logo_preview()
-
                     try:
                         sidebar_logo.content = build_logo_image(width=180, height=180)
                         sidebar_logo.update()
@@ -13684,80 +14452,84 @@ async def main(page: ft.Page):
         }
         AUTO_METHOD_MAP_REVERSE = {v: k for k, v in AUTO_METHOD_MAP.items()}
 
+        from services import _bs
         auto_enabled = ft.Checkbox(
             label="فعال‌سازی صدور خودکار شارژ ماهانه",
-            value=(get_setting("auto_charge_enabled", "0") == "1"),
+            value=(_bs("auto_charge_enabled", "0") == "1"),
         )
-        current_auto_method = get_setting("auto_charge_method", "manual")
+        current_auto_method = _bs("auto_charge_method", "manual")
         current_auto_method_text = AUTO_METHOD_MAP_REVERSE.get(current_auto_method, "مبلغ ثابت")
 
         auto_method = ft.Dropdown(
             label="روش محاسبه", width=220, value=current_auto_method_text,
-            options=[ft.dropdown.Option(text="مبلغ ثابت"),
-                     ft.dropdown.Option(text="بر اساس متراژ"),
-                     ft.dropdown.Option(text="بر اساس نفرات")],
+            options=[
+                ft.dropdown.Option(text=t)
+                for t in AUTO_METHOD_MAP.keys()
+            ],
         )
         auto_value = make_amount_field(
             label="مبلغ / نرخ", width=200,
-            initial_value=get_setting("auto_charge_value", "0"),
+            initial_value=_bs("auto_charge_value", "0"),
         )
         auto_issue_day = ft.TextField(
             label="روز صدور شارژ (1-28)", width=180,
-            value=get_setting("auto_charge_issue_day", "1"), hint_text="مثال: 1",
+            value=_bs("auto_charge_issue_day", "1"), hint_text="مثال: 1",
         )
         auto_due_day = ft.TextField(
             label="روز مهلت پرداخت (1-28)", width=180,
-            value=get_setting("auto_charge_due_day", "15"), hint_text="مثال: 15",
+            value=_bs("auto_charge_due_day", "15"), hint_text="مثال: 15",
         )
 
         sms_on_issue = ft.Checkbox(
             label="ارسال پیامک هنگام صدور شارژ",
-            value=(get_setting("sms_on_issue", "0") == "1"),
+            value=(_bs("sms_on_issue", "0") == "1"),
         )
         sms_reminder = ft.Checkbox(
             label="ارسال پیامک یادآوری ۱ روز قبل از سررسید",
-            value=(get_setting("sms_reminder", "0") == "1"),
+            value=(_bs("sms_reminder", "0") == "1"),
         )
         sms_overdue = ft.Checkbox(
             label="ارسال پیامک پس از عدم پرداخت",
-            value=(get_setting("sms_overdue", "0") == "1"),
+            value=(_bs("sms_overdue", "0") == "1"),
         )
         sms_thanks_on_payment = ft.Checkbox(
             label="📬 ارسال پیامک تشکر پس از ثبت پرداخت",
-            value=(get_setting("sms_thanks_on_payment", "0") == "1"),
+            value=(_bs("sms_thanks_on_payment", "0") == "1"),
         )
 
         late_fee_enabled = ft.Checkbox(
             label="فعال‌سازی جریمه دیرکرد",
-            value=(get_setting("late_fee_enabled", "0") == "1"),
+            value=(_bs("late_fee_enabled", "0") == "1"),
         )
         late_fee_amount = make_amount_field(
             label="مبلغ جریمه", width=200,
-            initial_value=get_setting("late_fee_amount", "100000"),
+            initial_value=_bs("late_fee_amount", "100000"),
         )
 
-        # ─── شناسه قبض‌ها ───
+        # ─── شناسه قبض‌ها (per-building) ───
+        from services import _bs
         water_bill_id = ft.TextField(label="شناسه قبض آب", width=250,
-                                     value=get_setting("water_bill_id", ""), hint_text="13 رقمی")
+                                     value=_bs("water_bill_id", ""), hint_text="13 رقمی")
         electricity_bill_id = ft.TextField(label="شناسه قبض برق", width=250,
-                                           value=get_setting("electricity_bill_id", ""), hint_text="13 رقمی")
+                                           value=_bs("electricity_bill_id", ""), hint_text="13 رقمی")
         gas_bill_id = ft.TextField(label="شناسه قبض گاز", width=250,
-                                   value=get_setting("gas_bill_id", ""), hint_text="13 رقمی")
+                                   value=_bs("gas_bill_id", ""), hint_text="13 رقمی")
 
         # ─── پیامک SMSGate ───
         smsgate_username = ft.TextField(
             label="نام کاربری SMSGate (ایمیل یا Username)", width=320,
-            value=get_setting("smsgate_username", ""),
+            value=_bs("smsgate_username", ""),  # ← _bs
             hint_text="مثلاً: COCEGG",
         )
         smsgate_password = ft.TextField(
             label="رمز SMSGate", width=400,
-            value=get_setting("smsgate_password", ""),
+            value=_bs("smsgate_password", ""),  # ← _bs
             password=True, can_reveal_password=True,
         )
         sms_test_phone = ft.TextField(
             label="شماره تست (موبایل خودت)", width=250,
-            value=get_setting("sms_test_phone", ""), hint_text="09123456789",
+            value=_bs("sms_test_phone", ""),  # ← _bs
+            hint_text="09123456789",
         )
         sms_credit_text = ft.Text("", size=13, color=TEXT_SECONDARY)
 
@@ -13813,16 +14585,18 @@ async def main(page: ft.Page):
                 msg(str(ex), D)
 
         def on_save_bank(e):
-            set_setting("bank_card", bc.value)
-            set_setting("bank_account", bac.value)
-            set_setting("bank_sheba", bsh.value)
-            set_setting("bank_owner", bon.value)
+            from services import _bsset
+            _bsset("bank_card", bc.value)
+            _bsset("bank_account", bac.value)
+            _bsset("bank_sheba", bsh.value)
+            _bsset("bank_owner", bon.value)
             msg("اطلاعات بانکی ذخیره شد.")
 
         def on_save_balance(e):
             try:
+                from services import _bsset
                 val = read_amount(init_bal.value)
-                set_setting("initial_balance", str(int(val)))
+                _bsset("initial_balance", str(int(val)))
                 msg("موجودی اولیه ذخیره شد.")
             except (ValueError, TypeError):
                 msg("مبلغ وارد شده صحیح نیست!", D)
@@ -13837,12 +14611,14 @@ async def main(page: ft.Page):
             msg(f"✅ واحد پول به {currency_selector.value} تغییر کرد.", S)
 
         def on_save_bill_ids(e):
-            set_setting("water_bill_id", water_bill_id.value.strip())
-            set_setting("electricity_bill_id", electricity_bill_id.value.strip())
-            set_setting("gas_bill_id", gas_bill_id.value.strip())
-            msg("شناسه قبض‌ها ذخیره شد.")
+            from services import _bsset
+            _bsset("water_bill_id", water_bill_id.value.strip())
+            _bsset("electricity_bill_id", electricity_bill_id.value.strip())
+            _bsset("gas_bill_id", gas_bill_id.value.strip())
+            msg("شناسه قبض‌ها ذخیره شد.", S)
 
         def on_save_auto(e):
+            from services import _bsset
             try:
                 issue_day = int(auto_issue_day.value or 1)
                 due_day = int(auto_due_day.value or 15)
@@ -13861,27 +14637,27 @@ async def main(page: ft.Page):
 
             method_key = AUTO_METHOD_MAP.get(auto_method.value, "manual")
 
-            set_setting("auto_charge_enabled", "1" if auto_enabled.value else "0")
-            set_setting("auto_charge_method", method_key)
-            set_setting("auto_charge_value", str(int(read_amount(auto_value.value))))
-            set_setting("auto_charge_issue_day", str(issue_day))
-            set_setting("auto_charge_due_day", str(due_day))
-            set_setting("sms_on_issue", "1" if sms_on_issue.value else "0")
-            set_setting("sms_reminder", "1" if sms_reminder.value else "0")
-            set_setting("sms_overdue", "1" if sms_overdue.value else "0")
-            set_setting("sms_thanks_on_payment",
-                        "1" if sms_thanks_on_payment.value else "0")
-            set_setting("late_fee_enabled", "1" if late_fee_enabled.value else "0")
-            set_setting("late_fee_amount",
-                        str(int(read_amount(late_fee_amount.value))))
+            _bsset("auto_charge_enabled", "1" if auto_enabled.value else "0")
+            _bsset("auto_charge_method", method_key)
+            _bsset("auto_charge_value", str(int(read_amount(auto_value.value))))
+            _bsset("auto_charge_issue_day", str(issue_day))
+            _bsset("auto_charge_due_day", str(due_day))
+            _bsset("sms_on_issue", "1" if sms_on_issue.value else "0")
+            _bsset("sms_reminder", "1" if sms_reminder.value else "0")
+            _bsset("sms_overdue", "1" if sms_overdue.value else "0")
+            _bsset("sms_thanks_on_payment",
+                   "1" if sms_thanks_on_payment.value else "0")
+            _bsset("late_fee_enabled", "1" if late_fee_enabled.value else "0")
+            _bsset("late_fee_amount",
+                   str(int(read_amount(late_fee_amount.value))))
             msg("تنظیمات صدور خودکار ذخیره شد.", S)
 
         # ═══════════ SMSGate ═══════════
 
         def on_save_sms(e):
-            set_setting("smsgate_username", smsgate_username.value.strip())
-            set_setting("smsgate_password", smsgate_password.value.strip())
-            set_setting("sms_test_phone", sms_test_phone.value.strip())
+            _bsset("smsgate_username", smsgate_username.value.strip())  # ← _bsset
+            _bsset("smsgate_password", smsgate_password.value.strip())  # ← _bsset
+            _bsset("sms_test_phone", sms_test_phone.value.strip())  # ← _bsset
             msg("اطلاعات SMSGate ذخیره شد.", S)
 
         def on_check_credit(e):
@@ -13901,9 +14677,9 @@ async def main(page: ft.Page):
                 msg("شماره موبایل معتبر وارد کنید (با 09 شروع بشه)", D)
                 return
 
-            set_setting("smsgate_username", smsgate_username.value.strip())
-            set_setting("smsgate_password", smsgate_password.value.strip())
-            set_setting("sms_test_phone", test_phone)
+            _bsset("smsgate_username", smsgate_username.value.strip())  # ← _bsset
+            _bsset("smsgate_password", smsgate_password.value.strip())  # ← _bsset
+            _bsset("sms_test_phone", test_phone)  # ← _bsset
 
             simple_text = "🧪 این یک پیام تست از سیستم مدیریت ساختمان است."
             result = send_sms(test_phone, simple_text)
@@ -14169,7 +14945,8 @@ async def main(page: ft.Page):
                     ], wrap=True),
                 ], spacing=12)
             ),
-        ], scroll=ft.ScrollMode.AUTO, expand=True)
+        ], scroll=ft.ScrollMode.AUTO, expand=True,
+            key="settings_page")  # ← این خط اضافه شد
 
 
     # ----------------------------------------------------------------------
@@ -14300,21 +15077,83 @@ async def main(page: ft.Page):
                 # ⭐ ۲ ثانیه‌ی اضافه (طبق درخواست) قبل از رفتن به صفحه‌ی بعد
                 await asyncio.sleep(2)
 
-                # بارگذاری صفحه
-                new_content = builder()
-                content_area.content = new_content
+                # ═══════════ بارگذاری صفحه ═══════════
+                import time as _t
+
+                page_content = builder()
+
+                # ⭐ نکته‌ی کلیدی: key یکتا رو روی خودِ Column (که
+                # اسکرول داره) ست می‌کنیم. چون Flutter وقتی widget
+                # با type یکسان + key یکسان ببینه، scroll state
+                # قبلی رو حفظ می‌کنه. با ست کردن key جدید، widget
+                # قبلی کاملاً dispose می‌شه و scroll به بالا برمی‌گرده.
+                try:
+                    page_content.key = f"page_{_t.time_ns()}"
+                except Exception:
+                    pass
+
+                content_area.content = page_content
                 page.update()
+
+                # ⭐ تلاش برای اسکرول مستقیم روی Column
+                # (اگه نسخه‌ی flet از scroll_to روی Column پشتیبانی کنه)
+                try:
+                    await page_content.scroll_to(offset=0)
+                except Exception:
+                    pass
 
             except asyncio.CancelledError:
                 # task کنسل شده - عادی هست
                 pass
+
             except Exception as ex:
                 print(f"❌ خطای انیمیشن: {ex}")
+                import traceback
+                traceback.print_exc()
+
                 try:
-                    content_area.content = builder()
+                    page_content = builder()
+                    try:
+                        import time as _t2
+                        page_content.key = f"page_{_t2.time_ns()}"
+                    except Exception:
+                        pass
+                    content_area.content = page_content
                     page.update()
-                except Exception:
-                    pass
+
+                except Exception as ex2:
+                    print(f"❌ خطای builder: {ex2}")
+                    import traceback
+                    traceback.print_exc()
+
+                    # ⭐ نمایش پیام خطا به کاربر
+                    try:
+                        content_area.content = ft.Container(
+                            padding=40,
+                            content=ft.Column([
+                                ft.Icon(
+                                    ft.Icons.ERROR_OUTLINE,
+                                    color="red", size=60
+                                ),
+                                ft.Text(
+                                    "خطا در بارگذاری صفحه:",
+                                    size=16,
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                                ft.Text(
+                                    str(ex2), size=12,
+                                    color="gray", selectable=True,
+                                ),
+                            ],
+                                spacing=10,
+                                horizontal_alignment=(
+                                    ft.CrossAxisAlignment.CENTER
+                                ),
+                            ),
+                        )
+                        page.update()
+                    except Exception:
+                        pass
 
         # ⭐ ذخیره task جدید
         current_nav_task["task"] = page.run_task(
@@ -14464,6 +15303,104 @@ async def main(page: ft.Page):
 
     page.window.prevent_close = True  # ⭐ مهم: جلوی بسته شدن خودکار رو بگیر
     page.window.on_event = handle_window_event
+
+    # ═══════════════════════════════════════
+    # ═══ Selector ساختمون فعال ═══
+    # ═══════════════════════════════════════
+    _building_selector_ref = {"dd": None, "buildings": []}
+
+    def _build_building_selector():
+        """dropdown انتخاب ساختمون فعال برای سایدبار"""
+        try:
+            from services import list_buildings, switch_building
+            buildings = list_buildings()
+        except Exception as ex:
+            print(f"⚠️ خطا در list_buildings: {ex}")
+            return ft.Container()
+
+        if not buildings:
+            return ft.Container()
+
+        _building_selector_ref["buildings"] = buildings
+
+        # ⭐ فقط text (چون Flet قبلی از key پشتیبانی درست نمی‌کنه)
+        options = [
+            ft.dropdown.Option(text=b["name"])
+            for b in buildings
+        ]
+
+        active = next(
+            (b for b in buildings if b["is_active"]),
+            buildings[0]
+        )
+
+        dd = ft.Dropdown(
+            label="🏢 ساختمان فعال",
+            width=180,
+            value=active["name"],       # ⭐ نام، نه id
+            options=options,
+            text_size=11,
+        )
+
+        # ⭐ نگه‌داشتن ref برای refresh
+        _building_selector_ref["dd"] = dd
+
+        def on_change(e):
+            try:
+                selected_name = e.control.value
+                # پیدا کردن id از اسم
+                target = next(
+                    (b for b in _building_selector_ref["buildings"]
+                     if b["name"] == selected_name),
+                    None,
+                )
+                if not target:
+                    return
+
+                if target["is_active"]:
+                    return
+
+                switch_building(target["id"])
+                msg(f"✅ به «{target['name']}» منتقل شد", S)
+                nav(build_dashboard)
+            except Exception as ex:
+                msg(f"خطا در سوییچ: {ex}", D)
+
+        dd.on_change = on_change
+        return dd
+
+
+    def _refresh_building_selector():
+        """رفرش dropdown ساختمون فعال (بعد از add/delete/switch)"""
+        try:
+            from services import list_buildings
+            buildings = list_buildings()
+            _building_selector_ref["buildings"] = buildings
+
+            dd = _building_selector_ref.get("dd")
+            if dd is None:
+                return
+
+            # لیست جدید
+            dd.options = [
+                ft.dropdown.Option(text=b["name"])
+                for b in buildings
+            ]
+
+            # مقدار فعال جدید
+            active = next(
+                (b for b in buildings if b["is_active"]),
+                buildings[0] if buildings else None,
+            )
+            if active:
+                dd.value = active["name"]
+
+            try:
+                dd.update()
+            except Exception:
+                pass
+        except Exception as ex:
+            print(f"⚠️ خطا در refresh selector: {ex}")
 
     # ═══════════════════════════════════════
     # ═══ سیستم نوتیفیکیشن (قدم 6) ═══
@@ -14797,9 +15734,11 @@ async def main(page: ft.Page):
                 ft.Container(height=5),
                 ft.Container(
                     height=1,
-                    bgcolor="#CCCCCC",  # ← رنگ ثابت
+                    bgcolor="#CCCCCC",
                 ),
                 ft.Container(height=5),
+                menu_btn("ساختمان‌ها", ft.Icons.BUSINESS,
+                         lambda e: nav(build_buildings_page)),
                 menu_btn("داشبورد", ft.Icons.DASHBOARD,
                          lambda e: nav(build_dashboard)),
                 menu_btn("واحدها", ft.Icons.APARTMENT,
@@ -14819,11 +15758,11 @@ async def main(page: ft.Page):
                 menu_btn("تنظیمات", ft.Icons.SETTINGS,
                          lambda e: nav(build_settings_page)),
 
-                # ─── بخش جدید: خروج و نام کاربر ───
+                # ─── بخش خروج و نام کاربر ───
                 ft.Container(height=10),
                 ft.Container(
                     height=1,
-                    bgcolor="#CCCCCC",  # ← رنگ ثابت
+                    bgcolor="#CCCCCC",
                 ),
                 ft.Container(height=5),
 
@@ -14841,7 +15780,7 @@ async def main(page: ft.Page):
                 ft.Container(height=5),
                 ft.Container(
                     height=1,
-                    bgcolor="#CCCCCC",  # ← رنگ ثابت
+                    bgcolor="#CCCCCC",
                 ),
                 ft.Container(height=5),
 
@@ -14853,7 +15792,9 @@ async def main(page: ft.Page):
                     ),
                     alignment=ft.Alignment.CENTER,
                 ),
-            ], spacing=4)
+            ],
+            spacing=4,
+        )
     )
 
     # ══════════════════════════════════════════════
