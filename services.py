@@ -676,18 +676,6 @@ def delete_charge(charge_id):
 
 
 def mark_charge_paid(charge_id):
-    """
-    تسویه کامل یک شارژ.
-
-    توجه: قبلاً این تابع فقط paid_amount/status شارژ رو تغییر
-    می‌داد و هیچ رکورد Payment ثبت نمی‌کرد. مشکل این بود که
-    delete_payment وضعیت پرداخت همه‌ی شارژهای یک واحد رو از
-    روی جدول Payment از نو محاسبه می‌کنه؛ پس اگر کاربر بعداً
-    یک پرداخت دیگه از همون واحد رو حذف می‌کرد، این شارژ که با
-    mark_charge_paid تسویه شده بود (بدون Payment) دوباره
-    «پرداخت نشده» می‌شد. برای همین الان یک Payment واقعی هم
-    ثبت می‌کنیم تا در محاسبات بعدی حفظ بشه.
-    """
     with SessionLocal() as db:
         charge = db.query(Charge).filter(
             Charge.id == int(charge_id)
@@ -708,6 +696,8 @@ def mark_charge_paid(charge_id):
                 payment_method="تسویه دستی",
                 tracking_code="",
                 description=f"تسویه دستی شارژ #{charge.id}",
+                target_charge_id=charge.id,      # ⭐ این خط مهمه
+                target_period=charge.period,     # ⭐ این خط مهمه
             )
             db.add(payment)
 
@@ -775,6 +765,7 @@ def add_payment(unit_id, amount, payment_date=None,
                     f"باقیمانده: {target_remaining:,.0f}"
                 )
 
+            # ⭐⭐ ذخیره target_charge_id و target_period
             payment = Payment(
                 unit_id=unit.id, amount=amount,
                 payment_date=p_date,
@@ -782,6 +773,8 @@ def add_payment(unit_id, amount, payment_date=None,
                 tracking_code=str(tracking_code or "").strip(),
                 description=str(description or "").strip(),
                 receipt_image=str(receipt_image or ""),
+                target_charge_id=target.id,          # ⭐⭐
+                target_period=target.period,         # ⭐⭐
             )
             db.add(payment)
             target.paid_amount = (target.paid_amount or 0) + amount
@@ -789,7 +782,6 @@ def add_payment(unit_id, amount, payment_date=None,
             db.commit()
             db.refresh(payment)
 
-            # ═══ پیامک تشکر خودکار ═══
             try:
                 remaining_after = max(
                     (target.amount or 0) - (target.paid_amount or 0),
@@ -809,7 +801,7 @@ def add_payment(unit_id, amount, payment_date=None,
                 "payment_method": payment.payment_method,
             }
 
-        # ───── حالت ۲: پرداخت آزاد (تسویه پله‌ای بدهی‌ها) ─────
+        # ───── حالت ۲: پرداخت آزاد (FIFO) ─────
         unpaid = db.query(Charge).filter(
             Charge.unit_id == unit.id
         ).order_by(
@@ -828,9 +820,11 @@ def add_payment(unit_id, amount, payment_date=None,
         )
         if amount > total_debt:
             raise ValueError(
-                f"مبلغ از بدهی بیشتر است. "
-                f"بدهی: {total_debt:,.0f}"
+                f"مبلغ از بدهی بیشتر است. بدهی: {total_debt:,.0f}"
             )
+
+        # ⭐⭐ اولین شارژ بدهکار = دوره‌ی هدف
+        first_unpaid_charge = unpaid[0]
 
         payment = Payment(
             unit_id=unit.id, amount=amount,
@@ -839,6 +833,8 @@ def add_payment(unit_id, amount, payment_date=None,
             tracking_code=str(tracking_code or "").strip(),
             description=str(description or "").strip(),
             receipt_image=str(receipt_image or ""),
+            target_charge_id=None,
+            target_period=first_unpaid_charge.period,   # ⭐⭐
         )
         db.add(payment)
         remaining_pay = amount
@@ -855,7 +851,6 @@ def add_payment(unit_id, amount, payment_date=None,
         db.commit()
         db.refresh(payment)
 
-        # ═══ پیامک تشکر خودکار ═══
         try:
             total_remaining = 0
             all_charges = db.query(Charge).filter(
@@ -863,8 +858,7 @@ def add_payment(unit_id, amount, payment_date=None,
             ).all()
             for c in all_charges:
                 total_remaining += max(
-                    (c.amount or 0) - (c.paid_amount or 0),
-                    0
+                    (c.amount or 0) - (c.paid_amount or 0), 0
                 )
             send_payment_thanks_sms(
                 unit, amount, remaining_after=total_remaining,
@@ -879,7 +873,6 @@ def add_payment(unit_id, amount, payment_date=None,
             "payment_date": str(payment.payment_date),
             "payment_method": payment.payment_method,
         }
-
 
 def list_payments():
     with SessionLocal() as db:
@@ -900,6 +893,8 @@ def list_payments():
                 "description": p.description,
                 "receipt_image": p.receipt_image or "",
                 "created_at": p.created_at,
+                "target_charge_id": p.target_charge_id,   # ⭐⭐
+                "target_period": p.target_period,          # ⭐⭐
             }
             for p, u in rows
         ]
@@ -922,6 +917,8 @@ def delete_payment(payment_id):
         unit_id = payment.unit_id
         db.delete(payment)
         db.flush()
+
+        # ─── همه‌ی شارژهای واحد رو صفر کن ───
         charges = db.query(Charge).filter(
             Charge.unit_id == unit_id
         ).order_by(
@@ -930,23 +927,88 @@ def delete_payment(payment_id):
         for c in charges:
             c.paid_amount = 0
             c.status = "پرداخت نشده"
+
+        # ─── پرداخت‌های باقی‌مونده رو دوباره اعمال کن ───
+        # مهم: به جای FIFO کور، به target_charge_id / target_period احترام بذار
         remaining_payments = db.query(Payment).filter(
             Payment.unit_id == unit_id
         ).order_by(
-            Payment.created_at.asc(), Payment.id.asc()
+            Payment.payment_date.asc().nulls_last(),
+            Payment.created_at.asc().nulls_last(),
+            Payment.id.asc(),
         ).all()
+
         for pay in remaining_payments:
-            rem = pay.amount
-            for charge in charges:
-                if rem <= 0:
-                    break
-                charge_rem = max(
-                    (charge.amount or 0) - (charge.paid_amount or 0), 0
+            # ─── مرحله ۱: اگه target_charge_id داره، اول اون ───
+            applied = False
+
+            if pay.target_charge_id:
+                target = db.query(Charge).filter(
+                    Charge.id == pay.target_charge_id,
+                    Charge.unit_id == unit_id,
+                ).first()
+                if target:
+                    rem_charge = max(
+                        (target.amount or 0) - (target.paid_amount or 0), 0
+                    )
+                    use = min(pay.amount, rem_charge)
+                    if use > 0:
+                        target.paid_amount = (target.paid_amount or 0) + use
+                        _update_charge_status(target)
+                    leftover = pay.amount - use
+                    if leftover > 0:
+                        for c in charges:
+                            if leftover <= 0:
+                                break
+                            if c.id == target.id:
+                                continue
+                            r = max((c.amount or 0) - (c.paid_amount or 0), 0)
+                            u = min(leftover, r)
+                            c.paid_amount = (c.paid_amount or 0) + u
+                            leftover -= u
+                            _update_charge_status(c)
+                    applied = True
+
+            # ─── مرحله ۲: اگه target_period داره ───
+            elif pay.target_period:
+                target = next(
+                    (c for c in charges if c.period == pay.target_period),
+                    None
                 )
-                use = min(rem, charge_rem)
-                charge.paid_amount = (charge.paid_amount or 0) + use
-                rem -= use
-                _update_charge_status(charge)
+                if target:
+                    rem_charge = max(
+                        (target.amount or 0) - (target.paid_amount or 0), 0
+                    )
+                    use = min(pay.amount, rem_charge)
+                    if use > 0:
+                        target.paid_amount = (target.paid_amount or 0) + use
+                        _update_charge_status(target)
+                    leftover = pay.amount - use
+                    if leftover > 0:
+                        for c in charges:
+                            if leftover <= 0:
+                                break
+                            if c.id == target.id:
+                                continue
+                            r = max((c.amount or 0) - (c.paid_amount or 0), 0)
+                            u = min(leftover, r)
+                            c.paid_amount = (c.paid_amount or 0) + u
+                            leftover -= u
+                            _update_charge_status(c)
+                    applied = True
+
+            # ─── مرحله ۳: FIFO خالص (فقط اگه هیچ target نداشت) ───
+            if not applied:
+                rem = pay.amount
+                for c in charges:
+                    if rem <= 0:
+                        break
+                    r = max((c.amount or 0) - (c.paid_amount or 0), 0)
+                    u = min(rem, r)
+                    c.paid_amount = (c.paid_amount or 0) + u
+                    rem -= u
+                    _update_charge_status(c)
+
         db.commit()
 
 

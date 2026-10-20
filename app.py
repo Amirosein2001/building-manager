@@ -2158,11 +2158,14 @@ ft.Text.__init__ = _persian_text_init
 
 _original_dropdown_option_init = ft.dropdown.Option.__init__
 
+
 def _fixed_dropdown_option_init(self, key=None, text=None, **kwargs):
     """رفع مشکل Flet: اگه هم key و هم text بده، text رو نمایش بده"""
     _original_dropdown_option_init(self, key=key, text=text, **kwargs)
 
+
 ft.dropdown.Option.__init__ = _fixed_dropdown_option_init
+
 
 # ═══════════ تنظیمات فونت ═══════════
 
@@ -2396,6 +2399,121 @@ async def main(page: ft.Page):
     except Exception:
         pass
 
+    # ⭐⭐ Migration: اضافه کردن ستون‌های target_charge_id و target_period
+    try:
+        from sqlalchemy import text
+        from database import engine
+        with engine.connect() as conn:
+            conn.execute(text(
+                "ALTER TABLE payments "
+                "ADD COLUMN target_charge_id INTEGER"
+            ))
+            conn.commit()
+            print("✅ ستون target_charge_id به payments اضافه شد")
+    except Exception:
+        pass
+
+    try:
+        from sqlalchemy import text
+        from database import engine
+        with engine.connect() as conn:
+            conn.execute(text(
+                "ALTER TABLE payments "
+                "ADD COLUMN target_period VARCHAR(20)"
+            ))
+            conn.commit()
+            print("✅ ستون target_period به payments اضافه شد")
+    except Exception:
+        pass
+
+    # ⭐⭐ Backfill هوشمند: شبیه‌سازی FIFO به ترتیب created_at
+    # ⭐⭐ Backfill هوشمند: بر اساس تاریخ فیش
+    try:
+        from database import SessionLocal as _SL_P
+        from models import Payment as _P, Charge as _C, Unit as _U
+        import jdatetime as _jdt
+
+        _MONTHS_ORDER = [
+            "", "فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور",
+            "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"
+        ]
+
+        def _payment_target_period(payment_date):
+            """روز ۲۹ به بعد → ماه بعد، بقیه → همون ماه"""
+            j = _jdt.date.fromgregorian(date=payment_date)
+            d, m, y = j.day, j.month, j.year
+            if d >= 29:
+                if m == 12:
+                    return f"{_MONTHS_ORDER[1]} {y + 1}"
+                return f"{_MONTHS_ORDER[m + 1]} {y}"
+            return f"{_MONTHS_ORDER[m]} {y}"
+
+        with _SL_P() as _db:
+            all_units = _db.query(_U).all()
+            total_updated = 0
+            total_skipped = 0
+
+            for unit in all_units:
+                pays = _db.query(_P).filter(
+                    _P.unit_id == unit.id
+                ).order_by(
+                    _P.payment_date.asc().nulls_last(),
+                    _P.created_at.asc().nulls_last(),
+                    _P.id.asc(),
+                ).all()
+
+                if not pays:
+                    continue
+
+                unit_charges = _db.query(_C).filter(
+                    _C.unit_id == unit.id
+                ).all()
+                if not unit_charges:
+                    continue
+
+                by_period = {c.period: c for c in unit_charges}
+
+                for pay in pays:
+                    if pay.target_charge_id is not None:
+                        continue
+
+                    if pay.payment_date is None:
+                        total_skipped += 1
+                        continue
+
+                    target_period = _payment_target_period(pay.payment_date)
+                    target = by_period.get(target_period)
+
+                    if target is None:
+                        # fallback: اولین شارژ بدهکار (FIFO)
+                        first_unpaid = next(
+                            (c for c in sorted(unit_charges,
+                                               key=lambda x: x.period)
+                             if (c.amount or 0) > (c.paid_amount or 0)),
+                            None
+                        )
+                        if first_unpaid:
+                            pay.target_charge_id = first_unpaid.id
+                            pay.target_period = first_unpaid.period
+                            total_updated += 1
+                        else:
+                            total_skipped += 1
+                        continue
+
+                    pay.target_charge_id = target.id
+                    pay.target_period = target.period
+                    total_updated += 1
+
+            _db.commit()
+            if total_updated or total_skipped:
+                print(
+                    f"✅ Backfill: {total_updated} پرداخت تخصیص داده شد، "
+                    f"{total_skipped} پرداخت بدون شارژ ماند"
+                )
+    except Exception as ex:
+        print(f"⚠️ backfill payments error: {ex}")
+        import traceback
+        traceback.print_exc()
     # ⭐⭐ انتقال یادداشت‌های قدیمی (building_id=NULL) به ساختمون اول
     try:
         from database import SessionLocal as _SL_N
@@ -3239,6 +3357,7 @@ async def main(page: ft.Page):
                     color=color, selectable=True,
                     expand=True),
         ], spacing=6)
+
     # ═══════════ داشبورد ═══════════
     def build_dashboard():
         theme = get_theme_colors()
@@ -7162,17 +7281,19 @@ async def main(page: ft.Page):
             - دکمه تایید: مقادیر رو به فرم پرداخت منتقل می‌کنه
             """
             # ─── مقدار اولیه مبلغ (به تومان) ───
+            # ⭐ استخراج ایمن مقادیر (اگه None باشن، خالی بمونن)
+            amount_rial = ocr_result.get("amount_rial") or 0
             amount_toman = 0
-            if ocr_result.get("amount_rial"):
+            if amount_rial:
                 try:
-                    amount_toman = int(ocr_result["amount_rial"]) // 10
+                    amount_toman = int(amount_rial) // 10
                 except Exception:
                     amount_toman = 0
 
             confirm_amount = make_amount_field(
                 label="مبلغ",
                 width=300,
-                initial_value=amount_toman,
+                initial_value=amount_toman if amount_toman > 0 else "",
             )
 
             confirm_tracking = ft.TextField(
@@ -7226,6 +7347,27 @@ async def main(page: ft.Page):
             # ─── ستون فیلدها ───
             fields_col = ft.Column(
                 controls=[
+                    # ⭐ بنر هشدار
+                    ft.Container(
+                        bgcolor=theme["warning_bg"],
+                        border_radius=8,
+                        padding=10,
+                        visible=(not ocr_result.get("success")),
+                        content=ft.Row([
+                            ft.Icon(
+                                ft.Icons.WARNING_AMBER,
+                                color=theme["warning"], size=18,
+                            ),
+                            ft.Text(
+                                "هیچ اطلاعاتی استخراج نشد. "
+                                "لطفاً مقادیر را دستی وارد کنید.",
+                                size=11, color=theme["warning"],
+                                weight=ft.FontWeight.BOLD,
+                            ),
+                        ], spacing=6),
+                    ),
+
+                    # این خط دیگه دست‌نخورده می‌مونه
                     ft.Text(
                         "📄 اطلاعات استخراج‌شده",
                         size=16,
@@ -7299,18 +7441,15 @@ async def main(page: ft.Page):
                                 color=P,
                             ),
                             ft.Text(
-                                f"💰 مبلغ: "
-                                f"{ocr_result.get('source_amount', '-')}",
+                                f"💰 مبلغ: {ocr_result.get('source_amount') or '-'}",
                                 size=9, color=TEXT_SECONDARY,
                             ),
                             ft.Text(
-                                f"📌 پیگیری: "
-                                f"{ocr_result.get('source_tracking', '-')}",
+                                f"📌 پیگیری: {ocr_result.get('source_tracking') or '-'}",
                                 size=9, color=TEXT_SECONDARY,
                             ),
                             ft.Text(
-                                f"📅 تاریخ: "
-                                f"{ocr_result.get('source_date', '-')}",
+                                f"📅 تاریخ: {ocr_result.get('source_date') or '-'}",
                                 size=9, color=TEXT_SECONDARY,
                             ),
                         ], spacing=2),
@@ -7436,6 +7575,16 @@ async def main(page: ft.Page):
                     import traceback
                     traceback.print_exc()
                     result = {"success": False, "error": str(e)}
+                    # ⭐ بررسی که EasyOCR واقعاً در دسترسه یا نه
+                    try:
+                        from receipt_parser import _get_ocr as _check_ocr
+                        _reader = _check_ocr()
+                        if not _reader:
+                            print("⚠️⚠️⚠️ هشدار: EasyOCR لود نشده! فقط Tesseract استفاده می‌شه.")
+                            # می‌تونی به کاربر هم نشون بدی:
+                            # msg("⚠️ EasyOCR لود نشد - استخراج فقط با Tesseract انجام می‌شه", W)
+                    except Exception:
+                        pass
 
                 async def _apply():
                     try:
@@ -7444,27 +7593,22 @@ async def main(page: ft.Page):
                     except Exception:
                         pass
 
+                    # ⭐ همیشه دیالوگ تایید رو باز کن، حتی اگه استخراج موفق نبود
                     if not result.get("success"):
                         ocr_status_text.value = (
-                            "⚠️ اطلاعاتی استخراج نشد. دستی پر کنید."
+                            "⚠️ اطلاعاتی استخراج نشد — می‌توانید دستی وارد کنید"
                         )
                         ocr_status_text.color = W
-                        try:
-                            page.update()
-                        except Exception:
-                            pass
-                        return
+                    else:
+                        ocr_status_text.value = "✅ استخراج شد — لطفاً تایید کنید"
+                        ocr_status_text.color = S
 
-                    ocr_status_text.value = (
-                        "✅ استخراج شد — لطفاً تایید کنید"
-                    )
-                    ocr_status_text.color = S
                     try:
                         page.update()
                     except Exception:
                         pass
 
-                    # ⭐ نمایش دیالوگ تایید
+                    # ⭐ همیشه دیالوگ باز بشه
                     show_ocr_confirm_dialog(uploaded_path, result)
 
                 try:
@@ -7844,78 +7988,20 @@ async def main(page: ft.Page):
                 total_remaining = total_amount - total_paid
                 pct = (total_paid / total_amount * 100) if total_amount > 0 else 0
 
-                period_charge_ids = set(r["id"] for r in period_rows)
-                unit_ids = list(set(r["unit_id"] for r in period_rows))
+                # ⭐⭐⭐ FIX: استفاده از target_period (به جای FIFO قدیمی)
+                all_payments_raw = list_payments()
+                period_payments = [
+                    p for p in all_payments_raw
+                    if p.get("target_period") == period
+                ]
 
-                period_payments = []
+                def _pay_sort_ep(p):
+                    pd = p.get("payment_date")
+                    if pd is None:
+                        return (1, 0)
+                    return (0, pd.toordinal())
 
-                if unit_ids:
-                    with SessionLocal() as db:
-                        all_charges = db.query(Charge).filter(
-                            Charge.unit_id.in_(unit_ids)
-                        ).order_by(
-                            Charge.created_at.asc(), Charge.id.asc()
-                        ).all()
-
-                        all_payments = db.query(Payment).filter(
-                            Payment.unit_id.in_(unit_ids)
-                        ).order_by(
-                            Payment.payment_date.asc(), Payment.id.asc()
-                        ).all()
-
-                        charges_by_unit = defaultdict(list)
-                        for c in all_charges:
-                            charges_by_unit[c.unit_id].append(c)
-
-                        payments_by_unit = defaultdict(list)
-                        for p in all_payments:
-                            payments_by_unit[p.unit_id].append(p)
-
-                        period_payment_ids = set()
-
-                        for uid in unit_ids:
-                            unit_charges = charges_by_unit[uid]
-                            unit_payments = payments_by_unit[uid]
-                            remaining = {c.id: float(c.amount or 0) for c in unit_charges}
-
-                            for p in unit_payments:
-                                amt = float(p.amount or 0)
-                                first_hit_charge_id = None
-                                for c in unit_charges:
-                                    if remaining[c.id] <= 0:
-                                        continue
-                                    if first_hit_charge_id is None:
-                                        first_hit_charge_id = c.id
-                                    use = min(amt, remaining[c.id])
-                                    remaining[c.id] -= use
-                                    amt -= use
-                                    if amt <= 0:
-                                        break
-                                if first_hit_charge_id in period_charge_ids:
-                                    period_payment_ids.add(p.id)
-
-                        if period_payment_ids:
-                            matched_rows = db.query(Payment, Unit).join(
-                                Unit, Payment.unit_id == Unit.id
-                            ).filter(
-                                Payment.id.in_(period_payment_ids)
-                            ).order_by(Payment.payment_date.asc()).all()
-
-                            period_payments = [
-                                {
-                                    "id": pay.id, "unit_id": pay.unit_id,
-                                    "unit_number": u.number,
-                                    "resident_name": u.resident_name,
-                                    "amount": pay.amount,
-                                    "payment_date": pay.payment_date,
-                                    "payment_method": pay.payment_method,
-                                    "tracking_code": pay.tracking_code,
-                                    "description": pay.description,
-                                    "receipt_image": pay.receipt_image or "",
-                                    "created_at": pay.created_at,
-                                }
-                                for pay, u in matched_rows
-                            ]
+                period_payments.sort(key=_pay_sort_ep)
 
                 _log(f"payments: {len(period_payments)}")
 
@@ -7972,8 +8058,6 @@ async def main(page: ft.Page):
                 _log(traceback.format_exc())
                 msg(f"خطا: {ex}", D)
 
-
-                
                 import traceback
                 traceback.print_exc()
 
@@ -10571,6 +10655,7 @@ async def main(page: ft.Page):
             chart_col,
         ], scroll=ft.ScrollMode.AUTO, expand=True,
             key="bills_page")  # ← این خط اضافه شد
+
     # ═══════════ گزارش مالی ═══════════
     def build_reports_page():
         # ─── رنگ‌های تم ───
@@ -10694,14 +10779,35 @@ async def main(page: ft.Page):
 
                 if target:
                     for p in all_payments:
-                        pd = p.get("payment_date")
-                        if pd:
-                            try:
-                                j = jdatetime.date.fromgregorian(date=pd)
-                                if (j.year, j.month) == target:
-                                    payments.append(p)
-                            except Exception:
-                                pass
+                        # ⭐⭐ اولویت اول: target_period
+                        tp = p.get("target_period")
+                        matched_by_target = False
+
+                        if tp:
+                            parts = tp.strip().split()
+                            if len(parts) >= 2:
+                                try:
+                                    tp_year = int(parts[-1])
+                                    tp_month = (
+                                        MONTHS.index(parts[0])
+                                        if parts[0] in MONTHS else 0
+                                    )
+                                    if (tp_year, tp_month) == target:
+                                        payments.append(p)
+                                        matched_by_target = True
+                                except Exception:
+                                    pass
+
+                        # ⭐ fallback: اگه target_period نداشت
+                        if not tp and not matched_by_target:
+                            pd = p.get("payment_date")
+                            if pd:
+                                try:
+                                    j = jdatetime.date.fromgregorian(date=pd)
+                                    if (j.year, j.month) == target:
+                                        payments.append(p)
+                                except Exception:
+                                    pass
                     for e in all_expenses:
                         ed = e.get("expense_date")
                         if ed:
@@ -10814,21 +10920,22 @@ async def main(page: ft.Page):
             payments = data.get("payments", [])
             expenses = data.get("expenses", [])
 
-            total_charges = 0
-            total_paid_on_charges = 0
-            total_remaining = 0
-            for c in charges:
-                total_charges += c.get("amount", 0) or 0
-                total_paid_on_charges += c.get("paid_amount", 0) or 0
-                total_remaining += c.get("remaining", 0) or 0
+            total_charges = sum(c.get("amount", 0) or 0 for c in charges)
+            total_paid_on_charges = sum(
+                c.get("paid_amount", 0) or 0 for c in charges
+            )
+            total_remaining = sum(
+                c.get("remaining", 0) or 0 for c in charges
+            )
 
-            total_payments = 0
-            for p in payments:
-                total_payments += p.get("amount", 0) or 0
+            # ⭐⭐ کل دریافتی = مجموع پرداخت‌های فیلترشده
+            total_payments = sum(
+                p.get("amount", 0) or 0 for p in payments
+            )
 
-            total_expenses = 0
-            for e in expenses:
-                total_expenses += e.get("amount", 0) or 0
+            total_expenses = sum(
+                e.get("amount", 0) or 0 for e in expenses
+            )
 
             paid_count = 0
             unpaid_count = 0
@@ -10982,7 +11089,29 @@ async def main(page: ft.Page):
         def calc_all_payers_stats(charges, payments):
             """محاسبه آمار پرداخت + امتیاز نظم پرداخت هر واحد."""
 
-            def _payment_target_period(j_pd):
+            def _payment_target_period(p, j_pd):
+                """
+                تعیین دوره‌ی هدف یک پرداخت.
+                - اولویت اول: target_period ذخیره‌شده
+                - fallback: روز ۲۹ به بعد → ماه بعد
+                """
+                # ⭐⭐ اولویت اول: target_period
+                tp = p.get("target_period") if isinstance(p, dict) else None
+                if tp:
+                    parts = tp.strip().split()
+                    if len(parts) >= 2:
+                        try:
+                            y = int(parts[-1])
+                            m = (
+                                MONTHS.index(parts[0])
+                                if parts[0] in MONTHS else 0
+                            )
+                            if m > 0:
+                                return (y, m)
+                        except Exception:
+                            pass
+
+                # fallback
                 d = j_pd.day
                 m = j_pd.month
                 y = j_pd.year
@@ -10993,13 +11122,15 @@ async def main(page: ft.Page):
                 return (y, m)
 
             def _payment_score(diff):
-                """امتیاز یک پرداخت از 20."""
-                if diff > 0:
-                    return 10 + min(diff, 10)
-                elif diff == 0:
-                    return 10
-                else:
-                    return max(10 - min(abs(diff), 10), 0)
+                """
+                امتیاز یک پرداخت از 100.
+                - پایه: 50
+                - هر روز زودتر: +3
+                - هر روز دیرتر: -3
+                - محدوده: 0 تا 100
+                """
+                score = 50 + (diff * 3)
+                return max(0, min(100, score))
 
             def _pay_sort_key(p):
                 pd = p.get("payment_date")
@@ -11036,7 +11167,7 @@ async def main(page: ft.Page):
                     except Exception:
                         continue
 
-                    target_year, target_month = _payment_target_period(j_pd)
+                    target_year, target_month = _payment_target_period(p, j_pd)
 
                     try:
                         due = jdatetime.date(
@@ -11615,29 +11746,30 @@ async def main(page: ft.Page):
             result.append(summary_row)
 
             return ft.Column(result, spacing=0)
+
         # ═══════════════════════════════════════════
         # ⭐ کمک‌تابع: یادداشت و رنگ بر اساس امتیاز
         # ═══════════════════════════════════════════
         def _score_note(score):
-            """یادداشت متنی بر اساس امتیاز."""
-            if score >= 18:
+            """یادداشت متنی بر اساس امتیاز (سیستم ۱۰۰)."""
+            if score >= 90:
                 return "⭐⭐⭐ عالی"
-            elif score >= 15:
+            elif score >= 75:
                 return "⭐⭐ خیلی خوب"
-            elif score >= 12:
+            elif score >= 60:
                 return "👍 خوب"
-            elif score >= 8:
+            elif score >= 40:
                 return "⚡ متوسط"
             else:
                 return "⚠️ نیازمند پیگیری"
 
         def _score_color(score):
-            """رنگ امتیاز."""
-            if score >= 15:
+            """رنگ امتیاز (بر اساس سیستم ۱۰۰)."""
+            if score >= 80:
                 return S
-            elif score >= 12:
+            elif score >= 60:
                 return P
-            elif score >= 8:
+            elif score >= 40:
                 return W
             else:
                 return D
@@ -11673,19 +11805,21 @@ async def main(page: ft.Page):
                 content=ft.Column([
                     ft.Row([
                         ft.Icon(ft.Icons.INFO_OUTLINE, size=16, color=P),
-                        ft.Text("نحوه محاسبه امتیاز (از ۲۰)",
+                        ft.Text("نحوه محاسبه امتیاز (از ۱۰۰)",
                                 size=12, weight=ft.FontWeight.BOLD,
                                 color=P),
                     ], spacing=6),
                     ft.Container(height=4),
-                    ft.Text("• امتیاز پایه هر پرداخت: ۱۰",
+                    ft.Text("• امتیاز پایه هر پرداخت: ۵۰",
                             size=10, color=TEXT_SECONDARY),
-                    ft.Text("• زودتر از سررسید (روز ۱۰ ماه): +۱ به ازای هر روز (حداکثر +۱۰)",
+                    ft.Text("• زودتر از سررسید (روز ۱۰ ماه): +۳ به ازای هر روز",
                             size=10, color=S,
                             weight=ft.FontWeight.BOLD),
-                    ft.Text("• با تأخیر: −۱ به ازای هر روز (حداکثر −۱۰)",
+                    ft.Text("• با تأخیر: −۳ به ازای هر روز",
                             size=10, color=D,
                             weight=ft.FontWeight.BOLD),
+                    ft.Text("• محدوده امتیاز هر پرداخت: ۰ تا ۱۰۰",
+                            size=10, color=TEXT_MUTED),
                     ft.Text("• امتیاز نهایی هر واحد = میانگین امتیاز پرداخت‌هایش",
                             size=10, color=TEXT_SECONDARY),
                 ], spacing=2),
@@ -13704,7 +13838,6 @@ async def main(page: ft.Page):
             spacing=0,
             key="notes_page")  # ← این خط اضافه شد
 
-
     # ═══════════ اعمال آنیِ تغییر واحد پول/تم ═══════════
     def apply_appearance_change():
         """
@@ -13736,7 +13869,6 @@ async def main(page: ft.Page):
             page.update()
         except Exception as ex:
             print(f"⚠️ خطای اعمال آنیِ ظاهر: {ex}")
-
 
     # ═══════════════════════════════════════
     # ═══ صفحه‌ی مدیریت ساختمان‌ها ═══
@@ -14028,7 +14160,7 @@ async def main(page: ft.Page):
                                 tooltip="حذف",
                                 on_click=lambda e, bid=b["id"],
                                                 nm=b["name"]:
-                                    do_delete(bid, nm),
+                                do_delete(bid, nm),
                             ),
                         ], spacing=4),
                     ], spacing=12),
@@ -14094,7 +14226,6 @@ async def main(page: ft.Page):
             list_col,
         ], scroll=ft.ScrollMode.AUTO, expand=True,
             key="buildings_page")  # ← این خط اضافه شد
-
 
     # ═══════════ تنظیمات ═══════════
     def build_settings_page():
@@ -14948,7 +15079,6 @@ async def main(page: ft.Page):
         ], scroll=ft.ScrollMode.AUTO, expand=True,
             key="settings_page")  # ← این خط اضافه شد
 
-
     # ----------------------------------------------------------------------
 
     def menu_btn(text, icon, handler):
@@ -15337,7 +15467,7 @@ async def main(page: ft.Page):
         dd = ft.Dropdown(
             label="🏢 ساختمان فعال",
             width=180,
-            value=active["name"],       # ⭐ نام، نه id
+            value=active["name"],  # ⭐ نام، نه id
             options=options,
             text_size=11,
         )
@@ -15368,7 +15498,6 @@ async def main(page: ft.Page):
 
         dd.on_change = on_change
         return dd
-
 
     def _refresh_building_selector():
         """رفرش dropdown ساختمون فعال (بعد از add/delete/switch)"""

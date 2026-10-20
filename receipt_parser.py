@@ -94,19 +94,30 @@ def _get_ocr():
             import easyocr
             print("🔄 لود EasyOCR...")
             model_dir = _get_easyocr_model_dir()
+
+            # ⭐ چک فایل‌های موردنیاز
             if model_dir:
-                print(f"📁 مدل‌ها از: {model_dir}")
-                _ocr_reader = easyocr.Reader(
-                    ['fa', 'en'], gpu=False, verbose=False,
-                    model_storage_directory=model_dir,
-                )
-            else:
-                _ocr_reader = easyocr.Reader(
-                    ['fa', 'en'], gpu=False, verbose=False,
-                )
+                import glob
+                files = os.listdir(model_dir)
+                print(f"📁 فایل‌های موجود در {model_dir}: {files}")
+
+                required = ['craft_mlt_25k.pth', 'english_g2.pth', 'farsi_g2.pth']
+                missing = [f for f in required if f not in files]
+                if missing:
+                    print(f"⚠️⚠️⚠️ فایل‌های گم‌شده: {missing}")
+                    _ocr_reader = False
+                    return False
+
+            _ocr_reader = easyocr.Reader(
+                ['fa', 'en'], gpu=False, verbose=False,
+                model_storage_directory=model_dir,
+                download_enabled=False,  # ⭐ جلوگیری از دانلود
+            )
             print("✅ EasyOCR آماده")
         except Exception as ex:
             print(f"❌ EasyOCR خطا: {ex}")
+            import traceback
+            traceback.print_exc()
             _ocr_reader = False
     return _ocr_reader
 

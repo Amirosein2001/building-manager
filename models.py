@@ -90,6 +90,13 @@ class Payment(Base):
     tracking_code = Column(String(100), default="")
     description = Column(Text, default="")
     receipt_image = Column(String(500), default="")
+
+    # ⭐⭐ جدید: این پرداخت برای کدوم شارژ بوده
+    target_charge_id = Column(
+        Integer, ForeignKey("charges.id"), nullable=True
+    )
+    target_period = Column(String(20), nullable=True)
+
     created_at = Column(DateTime, default=datetime.now)
 
     unit = relationship("Unit", back_populates="payments")
