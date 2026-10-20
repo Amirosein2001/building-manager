@@ -79,25 +79,12 @@
 - ویندوز ۱۰/۱۱
 - یک گوشی اندروید با اپ [SMSGate](https://sms-gate.app) (برای ارسال پیامک)
 
+
+
 ### مراحل نصب
 
-```bash
-# ۱. کلون کردن مخزن
-git clone https://github.com/USERNAME/building-manager.git
-cd building-manager
+فایل نصبی را دانلود و نصب کنید.
 
-# ۲. ساخت محیط مجازی
-python -m venv .venv311
-.venv311\Scripts\activate
-
-# ۳. نصب پیش‌نیازها
-pip install -r requirements.txt
-
-# ۴. اجرا
-python app.py
-```
-
----
 
 ## 📁 ساختار پروژه
 
@@ -156,10 +143,10 @@ building_manager/
 
 ## 👤 توسعه‌دهنده
 
-**[نام و نام خانوادگی تو]**
+**[AmirEP]**
 
-- 🔗 گیت‌هاب: [@USERNAME](https://github.com/USERNAME)
-- 📧 ایمیل: your-email@example.com
+- 🔗 گیت‌هاب : https://github.com/Amirosein2001
+- 📧 ایمیل: Amirep2001@gmail.com
 
 ---
 
@@ -167,6 +154,6 @@ building_manager/
 
 **⭐ اگر این پروژه به کارت آمد، یه ستاره بزن! ⭐**
 
-Copyright © 2026 [نام تو]. All Rights Reserved under GPL v3.0.
+Copyright © 2026 AmirEP. All Rights Reserved under GPL v3.0.
 
 </div>
