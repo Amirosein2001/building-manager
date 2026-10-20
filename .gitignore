@@ -24,8 +24,7 @@ Tesseract-Lite/
 simplerec/
 
 
-build.bat
-setup.iss
+
 # اطلاعات کاربر
 uploads/
 reports/
@@ -89,3 +88,6 @@ installer_output/
 # ═══════════ Build artifacts ═══════════
 *.spec
 BuildingManager.spec
+
+build.bat
+setup.iss
